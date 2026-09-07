@@ -1,6 +1,8 @@
 package net.wcfcarolina13.GameAI.services;
 
 import net.wcfcarolina13.GameAI.services.dialogue.DialoguePacing;
+import net.wcfcarolina13.GameAI.services.dialogue.SpeechFloorPolicy;
+import net.wcfcarolina13.GameAI.services.dialogue.SpeechFloorService;
 import net.minecraft.entity.passive.AbstractHorseEntity;
 import net.minecraft.entity.passive.AbstractNautilusEntity;
 import net.minecraft.entity.passive.CamelEntity;
@@ -30,12 +32,19 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class PetProximityReactionService {
 
+    private static final org.slf4j.Logger LOGGER =
+            org.slf4j.LoggerFactory.getLogger(PetProximityReactionService.class);
+
     private static final double PET_RADIUS = 10.0D;
     private static final double NAUTILUS_RADIUS = 12.0D;
 
     private static final long WOLF_NEARBY_COOLDOWN_MS = 6L * 60_000L;
     private static final long WOLF_HURT_COOLDOWN_MS = 8_000L;
-    private static final long ANIMAL_WELL_BEHAVED_COOLDOWN_MS = 90_000L;
+    /** 5min, raised from 90s (1.1.216): its sibling animal/mount pools all run at 5min, and the
+     *  90s value let "I respect a well-behaved animal." repeat from the SAME bot 91 seconds after
+     *  itself in the 2026-09-06 field log. Matching the siblings also puts it at or above the
+     *  cross-bot dedup window, so neither a same-bot nor a cross-bot repeat can beat it. */
+    private static final long ANIMAL_WELL_BEHAVED_COOLDOWN_MS = 5L * 60_000L;
     private static final long MOUNT_QUALITY_COOLDOWN_MS = 5L * 60_000L;
     private static final long NAUTILUS_COOLDOWN_MS = 10L * 60_000L;
     private static final long CAT_COOLDOWN_MS = 5L * 60_000L;
@@ -430,8 +439,13 @@ public final class PetProximityReactionService {
      *  from Jake at :22 and Bob at :24 in the 2026-08-29 field log). A line recently spoken by
      *  a DIFFERENT bot is off the menu; the SAME bot repeating is still governed only by its
      *  own per-pool cooldown — 9 of the 11 pools hold exactly one line, so a bot-agnostic
-     *  window would have silently stretched every such pool's designed cadence (review #2). */
-    private static final long GLOBAL_LINE_DEDUP_MS = 120_000L;
+     *  window would have silently stretched every such pool's designed cadence (review #2).
+     *
+     *  <p>Raised from 120s to 300s in 1.1.216: at 120s the window expired BEFORE the 5-minute
+     *  mount/animal pool cooldowns it was meant to cover, so "Nice horse." and "That's a quality
+     *  animal." still crossed between bots at 122–123s in the 2026-09-06 field log. The dedup
+     *  window must be no shorter than the longest pool cooldown it guards. */
+    private static final long GLOBAL_LINE_DEDUP_MS = 300_000L;
 
     private record LineEcho(UUID botId, long atMs) {
     }
@@ -451,6 +465,19 @@ public final class PetProximityReactionService {
         long last = cooldownMap.getOrDefault(botId, 0L);
         if (forcedLineId == null && cooldownMs > 0L
                 && now - last < DialoguePacing.scaledCooldown(DialoguePacing.Stream.SCRIPTED, cooldownMs)) {
+            return false;
+        }
+
+        // Cross-lane speech floor: the pool cooldown above is per (bot, pool) only, so it cannot
+        // see a line another bot — or a soul scene — just delivered to the same player. An organic
+        // line arriving while the floor is closed is DROPPED, not deferred (deferring would only
+        // move the pile-up), and the pool cooldown is deliberately NOT consumed so the same
+        // trigger may speak once the floor reopens. Forced/debug fires (cooldownMs == 0) bypass
+        // the floor for the same reason they bypass the dedup: /bot dialogue test must always play.
+        UUID audience = CompanionCommunicationPolicy.resolveOwnerUuid(bot);
+        if (forcedLineId == null && cooldownMs > 0L && !SpeechFloorService.isFloorOpen(audience)) {
+            LOGGER.debug("[dialogue] pet-line dropped bot={} floorRemainingMs={}",
+                    bot.getName().getString(), SpeechFloorService.remainingMs(audience));
             return false;
         }
 
@@ -483,6 +510,9 @@ public final class PetProximityReactionService {
 
         GLOBAL_LAST_LINE.put(line.id, new LineEcho(botId, now));
         cooldownMap.put(botId, now);
+        // The line is committed from here on (overhead + voice-or-chat): arm the audience's floor
+        // so no other bot and no soul lane speaks over it.
+        SpeechFloorService.noteSpeech(audience, SpeechFloorPolicy.Source.SCRIPTED_AMBIENT);
         CompanionOverheadDialogueService.showOverheadLine(bot, line.text, 3_000, 48.0, "pet", line.id);
         BotDialoguePlayer.PlayResult result = BotDialoguePlayer.playSoundForBotDetailed(bot, line.sound, VoiceLineCategory.AMBIENT_CHATTER);
         if (result == BotDialoguePlayer.PlayResult.PLAYED || result == BotDialoguePlayer.PlayResult.THROTTLED) {

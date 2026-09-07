@@ -55,6 +55,8 @@ import net.wcfcarolina13.ChatUtils.VoiceLineCategory;
 import net.wcfcarolina13.ChatUtils.BotDialogueSounds;
 import net.wcfcarolina13.ChatUtils.ChatUtils;
 import net.wcfcarolina13.GameAI.BotEventHandler;
+import net.wcfcarolina13.GameAI.services.dialogue.SpeechFloorPolicy;
+import net.wcfcarolina13.GameAI.services.dialogue.SpeechFloorService;
 
 import net.minecraft.entity.player.HungerManager;
 
@@ -74,6 +76,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * Batch 3 Phase 1 non-topic context reactions.
  */
 public final class CompanionContextReactionService {
+
+    private static final org.slf4j.Logger LOGGER =
+            org.slf4j.LoggerFactory.getLogger(CompanionContextReactionService.class);
 
     private static final Random RNG = new Random();
 
@@ -1163,6 +1168,18 @@ public final class CompanionContextReactionService {
             return false;
         }
 
+        // Cross-lane speech floor: the per-trigger cooldown above is per (bot, triggerKey) only,
+        // so it cannot see a line another bot — or a soul scene — just delivered to the same
+        // player. An organic line arriving while the floor is closed is DROPPED, not deferred,
+        // and the trigger cooldown is deliberately NOT consumed so it may speak once the floor
+        // reopens. Forced/debug fires bypass the floor so /bot dialogue test always plays.
+        UUID audience = CompanionCommunicationPolicy.resolveOwnerUuid(bot);
+        if (forcedLineId == null && !SpeechFloorService.isFloorOpen(audience)) {
+            LOGGER.debug("[dialogue] context-line dropped bot={} trigger={} floorRemainingMs={}",
+                    bot.getName().getString(), triggerKey, SpeechFloorService.remainingMs(audience));
+            return false;
+        }
+
         String lastLineId = state.lastLineByTrigger.get(triggerKey);
         WeightedLine line = pickWeightedLine(pool, forcedLineId, lastLineId);
         if (line == null) {
@@ -1171,6 +1188,8 @@ public final class CompanionContextReactionService {
 
         state.lastTriggerMs.put(triggerKey, now);
         state.lastLineByTrigger.put(triggerKey, line.id);
+        // Committed from here on (overhead + voice-or-chat): arm the audience's floor.
+        SpeechFloorService.noteSpeech(audience, SpeechFloorPolicy.Source.SCRIPTED_AMBIENT);
         CompanionOverheadDialogueService.showOverheadLine(bot, line.text, 3_000, 48.0, "context", triggerKey);
 
         BotDialoguePlayer.PlayResult result = BotDialoguePlayer.playSoundForBotDetailed(bot, line.sound, VoiceLineCategory.REACTIONS);

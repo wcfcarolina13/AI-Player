@@ -3,6 +3,8 @@ package net.wcfcarolina13.GameAI.souls;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
+import net.wcfcarolina13.GameAI.services.dialogue.SpeechFloorPolicy;
+import net.wcfcarolina13.GameAI.services.dialogue.SpeechFloorService;
 import net.wcfcarolina13.GameAI.souls.voice.SoulVoiceGate;
 import net.wcfcarolina13.GameAI.souls.voice.SoulVoiceService;
 import org.slf4j.Logger;
@@ -274,6 +276,9 @@ public final class GroupScenePlayback {
         state.delivered++;
         state.lastDeliveredParticipant = line.participantIndex();
         state.deliveredLines.add(line);
+        // Cross-lane speech floor: the scene owner is the audience. Each delivered line holds the
+        // scripted ambient lanes off so nothing is wedged between two lines of a conversation.
+        SpeechFloorService.noteSpeech(scene.turn().ownerId(), SpeechFloorPolicy.Source.SOUL_SCENE_LINE);
 
         LOGGER.info("[souls] scene-playback routingId={} line={}/{} speaker={} text={} voiced={} listeners={}",
                 scene.turn().routingId(), state.lineIndex + 1, scene.lines().size(),
@@ -294,6 +299,10 @@ public final class GroupScenePlayback {
 
     private void finish(SceneState state, String outcome) {
         scenes.remove(state.scene.turn().ownerId());
+        // The single finish site is also the one place the post-scene quiet period is armed:
+        // scene occupancy clears here, and without this the audience is immediately fair game for
+        // the next scene and for every scripted ambient pool.
+        SpeechFloorService.noteSpeech(state.scene.turn().ownerId(), SpeechFloorPolicy.Source.SOUL_SCENE_END);
         LOGGER.info("[souls] scene-playback routingId={} outcome={} delivered={}/{}",
                 state.scene.turn().routingId(), outcome, state.delivered, state.scene.lines().size());
         committer.sceneFinished(state.scene.token(), state.delivered, state.scene.lines().size());

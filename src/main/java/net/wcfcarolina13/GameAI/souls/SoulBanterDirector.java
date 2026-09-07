@@ -3,6 +3,7 @@ package net.wcfcarolina13.GameAI.souls;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.wcfcarolina13.GameAI.services.CompanionCommunicationPolicy;
+import net.wcfcarolina13.GameAI.services.dialogue.SpeechFloorService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -171,6 +172,10 @@ public final class SoulBanterDirector {
             recordVerdict(playerId, Lane.IDLE, "vetoed:" + veto);
             return;
         }
+        if (!speechFloorOpen(playerId)) {
+            recordVerdict(playerId, Lane.IDLE, "vetoed:speech-floor");
+            return;
+        }
         beginScene(playerId, rosterBots, Lane.IDLE);
     }
 
@@ -200,7 +205,23 @@ public final class SoulBanterDirector {
             recordVerdict(playerId, Lane.ACTIVE, "vetoed:" + veto);
             return;
         }
+        if (!speechFloorOpen(playerId)) {
+            recordVerdict(playerId, Lane.ACTIVE, "vetoed:speech-floor");
+            return;
+        }
         beginScene(playerId, rosterBots, Lane.ACTIVE);
+    }
+
+    /**
+     * Cross-lane speech floor (1.1.216). {@code runtime.isSceneBudgetFree} is occupancy-only and
+     * clears the instant a scene's finish site runs, so a second scene could open nine seconds
+     * after the first ended, and nothing here could see a scripted ambient line that had just
+     * landed on the same player. The floor is the shared "this audience was just spoken to" state
+     * and is applied identically to both lanes — it reads live speaking state only, and never
+     * either lane's toggle, so neither lane is coupled to the other.
+     */
+    private boolean speechFloorOpen(UUID playerId) {
+        return SpeechFloorService.isFloorOpen(playerId);
     }
 
     /** Phase A tail shared by both lanes: fetch recent events off-thread, hop back, fire. */
@@ -238,6 +259,12 @@ public final class SoulBanterDirector {
                 || !runtime.isSceneBudgetFree(playerId) || !ready
                 || now - SoulPlayerActivity.lastChatAt(playerId) < quietWindow) {
             recordVerdict(playerId, lane, "vetoed:changed-before-capture");
+            return;
+        }
+        // Re-check the cross-lane floor: Phase A's event fetch ran off-thread, so a scripted line
+        // or another scene may have taken the audience while we were waiting.
+        if (!speechFloorOpen(playerId)) {
+            recordVerdict(playerId, lane, "vetoed:speech-floor");
             return;
         }
 
