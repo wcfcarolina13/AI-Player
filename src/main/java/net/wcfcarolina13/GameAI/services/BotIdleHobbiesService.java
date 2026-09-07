@@ -1200,8 +1200,10 @@ public final class BotIdleHobbiesService {
             LAST_WOODEN_FALLBACK_SIGNATURE.put(botUuid, signature);
             NEXT_WOODEN_FALLBACK_TICK.remove(botUuid);
             // The signature flipping IS the "world changed" signal — an axe appeared in a reachable
-            // chest, a crafting input arrived. Reset the escalating backoff with the flat cooldown
-            // or the bot keeps serving out a ten-minute wait it no longer deserves.
+            // chest, a crafting input arrived. Reset the HobbyBackoffPolicy escalation ladder here
+            // (not in clearWoodenFallbackState, which fires on ordinary task-switch churn and must
+            // leave the ladder alone) or the bot keeps serving out a ten-minute wait it no longer
+            // deserves.
             clearWoodenFallbackBackoff(botUuid);
         }
 
@@ -1679,9 +1681,17 @@ public final class BotIdleHobbiesService {
         if (botUuid == null) {
             return;
         }
+        // Deliberately does NOT call clearWoodenFallbackBackoff (1.1.216 fix-wave correction).
+        // This method fires from ordinary scheduling churn — not-idle, following, sheltered,
+        // an unrelated active task — many times a minute in normal play. None of that is a
+        // world change, so it must not touch the escalating per-(bot, hobby) failure count or
+        // its next-allowed tick: doing so kept resetting the ladder back to its 60-second first
+        // step every time the bot switched tasks, so it never escalated far enough to actually
+        // suppress a doomed woodcut in practice. Only the flat NEXT_WOODEN_FALLBACK_TICK /
+        // LAST_WOODEN_FALLBACK_SIGNATURE in-flight state is cleared here; the backoff itself is
+        // reset only where the tool signature actually flips (see clearWoodenFallbackBackoff).
         NEXT_WOODEN_FALLBACK_TICK.remove(botUuid);
         LAST_WOODEN_FALLBACK_SIGNATURE.remove(botUuid);
-        clearWoodenFallbackBackoff(botUuid);
     }
 
     /**
@@ -1690,11 +1700,17 @@ public final class BotIdleHobbiesService {
      * <p>The backoff otherwise cleared only on success or {@code resetSession}, so it had no
      * "world changed" reset (1.1.216 review finding 7): four failures arm a ten-minute wait, the
      * commander drops an axe in a nearby chest thirty seconds later, the accessible-supply
-     * signature flips — and the fallback still stays suppressed for another nine minutes. Every
-     * site that decides the fallback's preconditions have genuinely changed calls this, so a real
-     * change buys a real retry. The flat {@code WOODEN_FALLBACK_COOLDOWN_TICKS} in-flight guard
-     * still bounds how fast a re-armed fallback can restart, which is what keeps a flapping
-     * signature from re-opening the restart storm.
+     * signature flips — and the fallback still stays suppressed for another nine minutes.
+     *
+     * <p>Called ONLY from the tool-signature-change branch in
+     * {@link #maybeHandleIdleWoodenFallback}, deliberately — that is the one site that knows the
+     * bot's accessible tool/weapon supply actually changed (an axe appeared in a reachable
+     * chest, a crafting input arrived), as opposed to the bot merely switching tasks. A first
+     * fix-wave version also called this from {@link #clearWoodenFallbackState}, which fires on
+     * every ordinary not-idle/follow/sheltered/active-task tick; that reset the escalation ladder
+     * back to its 60-second first step on unrelated scheduling churn and defeated the doubling
+     * backoff {@code HobbyBackoffPolicy} exists to provide. Keep this call scoped to the real
+     * signal only.
      *
      * <p>Scoped to {@link #WOODEN_FALLBACK_HOBBY} deliberately: this is wooden-fallback state, and
      * only the fallback's own start site consults the backoff gate. Clearing every hobby's counter
