@@ -3,7 +3,79 @@ task: "Backlog lineup 2026-09-03. DONE: 1.1.200, 1.1.201 (memory digest), 1.1.20
 test_command: "./gradlew build -x test"
 ---
 
-## Session Handoff 2026-09-06 (final) — next session starts here
+## Session Handoff 2026-09-07 — next session starts here
+
+**State:** main = origin/main @ 1.1.216 (pushed; deployed to all three Prism instances). Suite 945 green.
+First build in this project driven by a real field log rather than the backlog: Bradley played four minutes on
+2026-09-06 (22:29–22:33, instance 1.21.11, Jake + Bob, Roti mounted) and reported the bots talking over each
+other. The log is archived at `logs/2026-09-06-session-overlap.log.gz`. Frens had been field-blind since
+1.1.184, so this was the first evidence in a long while — and it was worth more than the backlog: both items
+shipped here came out of it, and the scoped hypothesis for the second one was wrong on every point.
+
+**Shipped in 1.1.216 (two root causes, four commits + one regression fix):**
+
+1. **Cross-lane speech floor.** Scripted ambient dialogue and soul group scenes shared no "someone is talking"
+   state at all — greps for `isSpeaking`, `speakingUntil`, `lastSpokeAt`, `quietPeriod` over `src/main`
+   returned nothing. Scripted cooldowns are per (bot, trigger-pool) with no aggregate, so three lines from two
+   bots landed inside one second at 22:30:08 and scripted lines interleaved with a playing scene at 22:32:11
+   and :15. The IDLE and ACTIVE banter lanes shared only `isSceneBudgetFree`, which is occupancy-only and
+   clears the instant `GroupScenePlayback.finish` runs, so a second scene fired nine seconds after the first
+   ended. New pure `SpeechFloorPolicy` (source-aware: scenes preempt a scripted floor, scripted respects
+   everything; 4s / 6s / 20s floors) plus `SpeechFloorService`, keyed by AUDIENCE and storing the deadline and
+   its `armedBy` label as one record so they cannot disagree. Consulted by both scripted reaction services and
+   by both banter lanes, armed by scene lines and scene end. Mount/animal repeats were the flat cross-bot
+   dedup window expiring, so the dedup is now per-pool, equal to that pool's own pacing-scaled cooldown.
+2. **Woodcut restart storm** — the repro that stood in "Needs Bradley" for two sessions is now captured and
+   fixed. `Idle hobby 'woodcut' finished … success=false` fired 197 times at 3–19 per second. The scoped
+   hypothesis (the picker re-picking with no backoff, `reason=''` read as "never started") was wrong on every
+   point: `Starting idle hobby` never appears in the log, `SkillExecutionResult` has no reason field, and every
+   restart came from `maybeHandleIdleWoodenFallback`. The real mechanism was a silent wipe — the fallback set
+   a 12s cooldown and started woodcut, and on the very next tick the active-task branch called
+   `clearWoodenFallbackState`, removing the cooldown it had just set for its OWN run. The 1.1.199 diagnostic
+   never printed because the same wipe removed the signature its guard tests. Fixed by narrowing that clear to
+   non-own tasks and adding a per-(bot, hobby) doubling failure backoff (`HobbyBackoffPolicy`, 60s to a
+   10-minute cap) written only from the existing `server.execute` block.
+
+**The regression worth remembering.** The batch review's finding 7 asked for a "world changed" reset so an axe
+in a chest would not be ignored for the rest of a ten-minute backoff, and the controller ruled it should hang
+off the tool-signature-change branch. That was wrong, and the scoped re-review caught it as Critical:
+`ToolProvisionService.computeAccessibleIdleFallbackSignature` hashes `scanAccessibleContainers` at the bot's
+CURRENT position, so it flips on movement alone. The backoff map had been the one piece of state immune to
+that flip, which was exactly what made the storm fix hold — a following bot with no axe would have wiped its
+own backoff by walking. The reset now hangs off real availability: the toolless early-out, or a probe
+throttled to once per 100 ticks that clears the backoff only when an axe is held or craftable.
+
+**Field checks pending:** Phase 6n in `docs/testing/FIELD_SESSION_1.1.202.md` (now 172 items), eleven items,
+no new toggles — the floor and the backoff are always on. The decisive ones are "A scene still gets through a
+scripted floor" (a run of only `vetoed:speech-floor` with no `fired` means scripted ambient is starving the
+soul lane), "Muting scripted dialogue does not mute souls" (the lane-separation rule), and "An axe in a chest
+wakes it back up" (the probe). Phases 6b–6m from 1.1.203–1.1.215 are all still unrun.
+
+**Deferred with reasons:** Piper TTS warm-up — two engines cold-started mid-scene (`ryan` 22:32:09, `lessac`
+22:32:12), real and cheap, but independent of the pile-up and it needs its own decision on which voices to
+pre-spawn for bots that may not be present. The `[LoadGoverner]` debug lines are the loudest prefix in the log
+(63 in a 50-second window) but belong to the separate LoadGoverner mod, not this repo, and the storm did not
+drive them — `transient floor refreshed stage=2` runs at a steady 1/s from before the burst to well after it.
+Unifying the two scripted services' cooldown implementations: larger refactor, no remaining field symptom.
+Adding a reason enum to `SkillExecutionResult`: touches every skill call site, and consecutive-failure counting
+already separates deterministic from transient failures. Unchanged from before: `FarmSkill.pillarEscape`;
+`WoodcutSkill.pillarUp`, `HovelPerimeterBuilder.pillarUp`, `WoodcutSkill.clearBlockingLeaves`; doorway rework.
+
+**Remaining autonomous candidates:** unchanged from the 2026-09-06 handoff and all still field-blocked —
+`threads.closed` matching (needs a per-question `SoulMindOps.markAnswered` overload), `BAD_AT` from repeated
+`TASK_FAILED`, TEASE peer rule once `SoulSpeechAct` rides on `GroupSceneTurn`,
+`SoulBanterDirector.relationsEnabled()` static read → supplier, `MIN_TRIGRAMS` 3→4, inlining the four
+single-caller Fortify delegates. New from this build: `SpeechFloorService.clear`/`clearAll` are unwired API
+(no service in that group registers a SERVER_STOPPING teardown), and the per-hobby backoff state is written for
+hunt and collect_dirt but read only by woodcut — ready if a later item gates `pickHobby` on tool availability.
+
+**Needs Bradley:** the guided field session (Phases 6b–6n) is now the only thing blocking everything else.
+Doorway rework decision; ACTION REQUESTS interview; Bob's TTS reference sample. The woodcut repro that used to
+sit here is DONE — captured in the 2026-09-06 log and fixed in 1.1.216.
+
+---
+
+## Session Handoff 2026-09-06 (final) — superseded
 
 **State:** main = origin/main @ 1.1.215 (pushed; deployed to all three Prism instances). Suite 903 green. 1.1.215 = one-line follow-up: leading list bullets (`-`, `•`, `>`) stripped before the `##FRENS` sentinel (the 1.1.214 re-review residual), no new field items. **Phase 3 of the soul
 conversation ontology is COMPLETE** — (d) 1.1.211, (a) 1.1.212, (b) 1.1.213, (c) 1.1.214.
@@ -491,14 +563,17 @@ track is validation-bound before anything new starts. Suite 621 green.
       constructs `OllamaAPI`; ollama4j is excluded from non-AI JARs, so every non-LLM caller (idle
       hobbies, auto-hunt, come-recovery, `/bot` skill commands) got a throwaway empty map.
       `SharedStateService` now owns the map; regression test guards the dependency.
-- [ ] **Woodcut fallback restart loop** (NEW, 1.1.199 log 01:14:01–01:14:04): the idle wooden
-      fallback restarted a doomed one-tree woodcut 34× in 3 s (bot has no axe; `WoodcutSkill.
-      prepareWoodcutTooling` refuses, `maybeHandleIdleWoodenFallback` fires again next tick). The
-      12 s cooldown (`NEXT_WOODEN_FALLBACK_TICK`) is wiped whenever `computeAccessibleIdleFallback
-      Signature` changes between ticks — nothing in the log shows what changes. 1.1.200 adds an INFO
-      line at that reset (`signature changed A -> B with N ticks of cooldown left`). Field session:
-      reproduce with an axeless bot near trees, read the line, then fix at the source. Product
-      question underneath: should the axeless fallback punch one tree instead of refusing?
+- [x] **Woodcut fallback restart loop** ✅ 1.1.216 — repro captured in the 2026-09-06 field log
+      (`logs/2026-09-06-session-overlap.log.gz`): 197 restarts at 3–19 per second. The 1.1.200
+      diagnostic never printed, and that was the clue — the same wipe removed the signature its
+      guard tests. Nothing exotic flips the signature: the active-task branch called
+      `clearWoodenFallbackState` on the very next tick, removing the 12 s cooldown the fallback had
+      just set for its OWN woodcut run, so the skill exited on the missing axe and restarted. Fixed
+      by narrowing that clear to non-own tasks plus a per-(bot, hobby) doubling failure backoff
+      (`HobbyBackoffPolicy`, 60 s to a 10-minute cap) with a throttled availability probe so an axe
+      arriving in a reachable chest still wakes it within about five seconds. The product question
+      underneath — should the axeless fallback punch one tree instead of refusing? — is still open
+      and is now a design choice, not a bug.
 - [x] **Soul follow-ups deferred in 1.1.178/1.1.179** — all three were already closed and the
       handoff above was stale: word-boundary bot-name match (`SoulLocalSalience.
       mentionsBotNotLeading`, regex `\b`), `vetoed:roster-lost` pushes `nextEligibleAtMs`

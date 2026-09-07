@@ -2,6 +2,110 @@
 
 Historical record and reasoning. `RALPH_TASK.md` is the source of truth for what’s next (active lineup at the top, backlog at the bottom).
 
+## Speech floor + idle-hobby backoff — first field evidence since 1.1.184; 1.1.216 (2026-09-07)
+
+Bradley played a four-minute session on 2026-09-06 (22:29–22:33, instance 1.21.11, Jake + Bob, Roti mounted)
+and reported "the bots were talking over each other, lots of stuff seemed to fire at once". The server log is
+archived at `logs/2026-09-06-session-overlap.log.gz`. Two independent root causes, both confirmed from the log
+before a line was written; the second one refuted the hypothesis it was scoped from.
+
+**1. Speech pile-up — two lanes and no speaking floor.** Scripted ambient dialogue and soul group scenes
+shared no "someone is talking" state at all: greps for `isSpeaking`, `speakingUntil`, `lastSpokeAt` and
+`quietPeriod` over `src/main` returned nothing. Scripted cooldowns are per (bot, trigger-pool), with no
+per-bot, per-audience or global aggregate, so three lines from two bots landed inside one second at 22:30:08
+(Jake "Who's a menace? You're a menace.", Bob "Guard dog on duty.", Bob "I respect a well-behaved animal.")
+and scripted lines at 22:32:11 and 22:32:15 interleaved with soul scene `2b8465f1` as it played its four
+voiced lines at :12/:17/:21/:26. The IDLE and ACTIVE banter lanes shared only `isSceneBudgetFree`, which is
+occupancy-only and clears the instant `GroupScenePlayback.finish` runs — so scene `c8b1595a` fired nine
+seconds after the first one ended.
+
+- `075ac6b2` **feat** — pure `SpeechFloorPolicy` (`Source` SCRIPTED_AMBIENT / SOUL_SCENE_LINE /
+  SOUL_SCENE_END; floors 4s / 6s / 20s; `armedUntil` never shortens an armed floor; a `sanitize` ceiling of
+  2x the post-scene quiet guards clock jumps) plus `SpeechFloorService`, a `ConcurrentHashMap` keyed by
+  AUDIENCE rather than by bot, so two companions cannot talk over each other to the same player.
+  `PetProximityReactionService` and `CompanionContextReactionService` consult it beside their pool cooldown
+  and arm it once a line is committed; `SoulBanterDirector` consults it identically in both lanes and in the
+  Phase-B re-check, logging `outcome=vetoed:speech-floor`; `GroupScenePlayback` arms it per delivered line
+  and again at `finish`. Mount/animal repeats were the dedup window expiring, not a logic bug:
+  `GLOBAL_LINE_DEDUP_MS` 120s → 300s (the cross-bot 122s "Nice horse." repeat) and
+  `ANIMAL_WELL_BEHAVED_COOLDOWN_MS` 90s → 300s (the same-bot 91s repeat), matching the sibling animal pools.
+  The same-bot dedup exemption is deliberate and was kept.
+
+**Rulings (item 1).** Scripted ambient lines are DROPPED, not deferred, when the floor is closed — deferring
+only moves the pile-up; cost if wrong: an occasional flavour line is skipped and the bots feel quieter. The
+floor is keyed by audience, not by bot; cost if wrong: two bots addressing the same player are serialised,
+which is the effect being asked for. A soul scene outranks scripted ambient (longer per-line floor, 20s
+post-scene quiet); cost if wrong: scripted flavour thins during and just after scenes, as intended. Lanes are
+gated only on live speaking state, never on the other lane's toggle — the 1.1.193 lane-separation rule stands.
+
+**2. Woodcut restart storm — the repro Bradley was asked for.** `Idle hobby 'woodcut' finished for Jake:
+success=false msg='I have no axe…'` fired 197 times, 3–19 per second, on thread `ambient-hobby-1`. The
+scoped hypothesis (the picker re-picking with no backoff, `reason=''` read as "never started") was WRONG on
+both counts: `Starting idle hobby` never appears in the log, `SkillExecutionResult` has no reason field at
+all, and every restart came from `maybeHandleIdleWoodenFallback`. The real mechanism is a silent wipe — the
+fallback set a 12s cooldown and started woodcut; on the very next tick the active-task branch called
+`clearWoodenFallbackState`, removing the cooldown it had just set for its OWN run; the skill exited in under
+a tick on the missing axe, and the next tick restarted it. A two-tick loop capped only by the 20 tps tick
+rate. The 1.1.199 diagnostic never printed because the same wipe removed the signature its guard tests.
+Corroboration: the sparse restarts at 22:30:32/:44/:56 are exactly 12s apart, the cooldown surviving on ticks
+where the whole skill ran between two ticks.
+
+- `cd4120ca` **fix** — the active-task clear is narrowed to tasks that are not the fallback's own woodcut run
+  (`isWoodenFallbackOwnTask`, matching on the ticket name, verified as `"skill:woodcut"` at `TaskService:219`);
+  new pure `HobbyBackoffPolicy` (`Attempt` record, `nextAllowedTick`, `nextFailureCount`, 60s doubling to a
+  10-minute cap, shift capped so it cannot overflow) backs a per-(bot, hobby) next-allowed tick and failure
+  counter, written only from the existing `server.execute` block so the state stays tick-ordered. An aborted
+  attempt does not count as a failure. A skipped hobby logs once per backoff window, not per tick.
+
+**Rulings (item 2).** Backoff is per (bot, hobby), not global, so a failing woodcut never suppresses a viable
+hobby; cost if wrong: a toolless bot backs each hobby off separately, so the first minute is chattier than a
+global backoff. The active-task clear is narrowed rather than deleted, so an unrelated task still lets the
+fallback retry promptly; cost if wrong: after an unrelated task the fallback waits out ≤12s, invisible in
+play. Aborts do not increment the counter; cost if wrong: repeated user cancellation retries with no growing
+delay. No reason enum was added to `SkillExecutionResult` — consecutive-failure counting separates
+deterministic from transient failures without touching every skill call site; cost if wrong: a permanently
+impossible hobby is still retried every ten minutes forever rather than disabled. The flat 12s in-flight
+guard was kept beneath the backoff so the dispatch-to-completion window is never ungated.
+
+**Deferred, with reasons.** Piper TTS warm-up: two engines cold-started mid-scene (`ryan` 22:32:09, `lessac`
+22:32:12), which is real and cheap to fix, but it is independent of the pile-up and needs its own decision on
+which voices to pre-spawn for bots that may not be present. The `[LoadGoverner]` debug lines are the loudest
+prefix in the log (63 in a 50-second window) but belong to the separate LoadGoverner mod, not this repo, and
+the storm did not drive them — `transient floor refreshed stage=2` runs at a steady 1/s from before the burst
+to well after it. Unifying the two scripted services' cooldown implementations is a larger refactor with no
+remaining field symptom. Adding a reason enum to `SkillExecutionResult` touches every skill call site.
+
+**Fix wave (batch review).** The review caught three things that would have shipped a floor that did not
+work. Scenes now preempt a scripted floor — the banter director evaluates every five seconds and a floor
+veto does not consume its cooldown, so a steady scripted stream could have locked the soul lane out forever;
+the policy is source-aware, and a scene request ignores a floor armed by scripted ambient while a scripted
+request respects every floor. The floor is armed only when a surface actually delivered: the first cut armed
+before `showOverheadLine`, so with the scripted Text and Voice masters muted a silent lane would have
+silenced the soul lane, which is exactly the lane-separation rule from 1.1.193. The audience is resolved
+through `resolveOwner` rather than `resolveOwnerUuid` (config `botOwnership` only), and an unresolvable
+audience skips the floor instead of keying a shared sentinel — otherwise the scripted lanes keyed a zero UUID
+while the soul lanes keyed the real player and the whole fix was inert. Also: the flat cross-bot dedup became
+a per-pool window equal to that pool's own cooldown, because the flat 300s would have stopped a second bot
+answering a hurt wolf for five minutes on an 8s pool; the post-scene quiet arms only when a line was
+delivered; a blank forced line id no longer bypasses the floor; the hobby backoff clears on a tool-signature
+change, so putting an axe in a chest is not ignored for the rest of a ten-minute backoff; and the hobby key
+strips `skill:` on both the read and the write side. A follow-up commit narrows the backoff reset to a real
+tool-signature change: the first cut also reset it from the ordinary not-idle, following and unrelated-task
+branches, which would have kept the ladder pinned at its 60-second first step for any bot that alternates
+between idle and commanded work. The scoped re-review then caught a Critical regression that my own fix-wave
+ruling had introduced: resetting the backoff from the tool-signature-change branch looked like "the world
+changed", but `ToolProvisionService.computeAccessibleIdleFallbackSignature` hashes the bot's inventory AND
+`scanAccessibleContainers` at its current position, so it flips whenever the bot merely moves. The backoff map
+had been the one piece of state immune to that flip, which is what made the storm fix hold. The reset is now
+driven by real axe availability instead, so a following bot with no axe cannot wipe its own backoff by walking,
+while an axe placed within reach still wakes it within seconds. Cost if wrong: an axe arriving by an unusual
+route is missed and the bot waits out its backoff, which is the pre-1.1.216 behaviour rather than a new
+failure.
+
+Tests 903 → 945.
+
+**Field checks:** Phase 6n in `docs/testing/FIELD_SESSION_1.1.202.md`.
+
 ## Soul side channel — leading list bullet before `##FRENS` stripped; 1.1.215 (2026-09-06)
 
 Follow-up to 1.1.214, requested by Bradley: the scoped re-review's one residual. `sideChannelTail`

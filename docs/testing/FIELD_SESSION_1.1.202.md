@@ -1,10 +1,10 @@
 # Field Session — Frens 1.1.202
 
-**Version under test:** `frens-1.1.215-release+1.21.11.jar` (1.1.201 memory digest + 1.1.202 torch/creeper diagnostics and the creeper fuse fix + 1.1.203 config sync / per-player mute masks — Phase 6b + 1.1.204 backlog run — Phase 6c + 1.1.205 loose ends — Phase 6d + 1.1.206 follow-ups — Phase 6e + 1.1.207 crafting/water — Phase 6f + 1.1.208 refactors — Phase 6g + 1.1.209 fortify extraction — Phase 6h + 1.1.210 carve extraction — Phase 6i + 1.1.211 novelty rejection — Phase 6j + 1.1.212 peer stance — Phase 6k + 1.1.213 typed relations — Phase 6l + 1.1.214 structured output — Phase 6m + 1.1.215 bullet-sentinel fix, no new items). Session protocol: `GUIDED_SESSION_PROTOCOL.md` beside this file.
+**Version under test:** `frens-1.1.216-release+1.21.11.jar` (1.1.201 memory digest + 1.1.202 torch/creeper diagnostics and the creeper fuse fix + 1.1.203 config sync / per-player mute masks — Phase 6b + 1.1.204 backlog run — Phase 6c + 1.1.205 loose ends — Phase 6d + 1.1.206 follow-ups — Phase 6e + 1.1.207 crafting/water — Phase 6f + 1.1.208 refactors — Phase 6g + 1.1.209 fortify extraction — Phase 6h + 1.1.210 carve extraction — Phase 6i + 1.1.211 novelty rejection — Phase 6j + 1.1.212 peer stance — Phase 6k + 1.1.213 typed relations — Phase 6l + 1.1.214 structured output — Phase 6m + 1.1.215 bullet-sentinel fix, no new items + 1.1.216 speech floor and idle-hobby backoff — Phase 6n). Session protocol: `GUIDED_SESSION_PROTOCOL.md` beside this file.
 **Date:** ____________  **Instance:** PrismLauncher `1.21.11`
 **Server log Claude tails:** `~/Library/Application Support/PrismLauncher/instances/1.21.11/minecraft/logs/latest.log`
 
-Nothing has been field-tested since 1.1.184. This is the merged, deduplicated checklist for **1.1.175 → 1.1.215** plus the Lane 1 / Lane 2 items from `RALPH_TASK.md` (Backlog Lineup 2026-09-03). One continuous session, run in order — souls are enabled once, calm tests precede noisy ones, day-boundary tests sit near the end, destructive resets last.
+Nothing has been field-tested since 1.1.184. This is the merged, deduplicated checklist for **1.1.175 → 1.1.216** plus the Lane 1 / Lane 2 items from `RALPH_TASK.md` (Backlog Lineup 2026-09-03). One continuous session, run in order — souls are enabled once, calm tests precede noisy ones, day-boundary tests sit near the end, destructive resets last.
 
 ## How the session runs
 
@@ -747,6 +747,69 @@ Requires `/bot soul relations on` for facts to be visible via `/bot soul beliefs
     production, not storage).
 
 ---
+
+## Phase 6n — Speech floor and idle-hobby backoff (1.1.216)
+
+First build driven by a real field log (`logs/2026-09-06-session-overlap.log.gz`, 2026-09-06 22:29–22:33).
+Needs Jake + Bob both spawned, souls enabled, and a rideable animal nearby for the mount lines. No new
+toggles: the floor and the backoff are always on.
+
+- [ ] **No two bots talk over each other (1.1.216)**
+  - Bradley does: stand near both bots with an animal in view for two minutes and let ambient lines fire.
+  - Claude watches for: `Sending chat message (withDelay=true)` timestamps in `latest.log`.
+  - Pass when: no two scripted lines land within four seconds of each other, and the 22:30:08 shape of
+    three lines from two bots inside one second never recurs.
+- [ ] **Scripted lines do not interleave with a soul scene (1.1.216)**
+  - Bradley does: trigger a scene (`/bot soul banter now`) while standing near an animal.
+  - Claude watches for: `[souls] scene-playback … line=N/M` and any `Sending chat message` between the
+    first and last line of that `routingId`.
+  - Pass when: no scripted line lands mid-scene, and none lands in the twenty seconds after
+    `outcome=finished`.
+- [ ] **A scene still gets through a scripted floor (1.1.216)**
+  - Bradley does: same as above, but keep the animal lines firing while asking for a scene.
+  - Claude watches for: `outcome=vetoed:speech-floor` versus `outcome=fired`.
+  - Pass when: scenes still fire — a run of only `vetoed:speech-floor` with no `fired` over several minutes
+    means scripted ambient is starving the soul lane and the preemption is not working.
+- [ ] **The two banter lanes respect one quiet period (1.1.216)**
+  - Bradley does: let two scenes fire back to back without intervening.
+  - Claude watches for: the gap between `scene-playback … outcome=finished` and the next
+    `banter lane=… outcome=fired`.
+  - Pass when: the gap is at least twenty seconds regardless of which lane fires — the 1.1.215 log had
+    IDLE finish at 22:32:26 and ACTIVE fire at 22:32:35.
+- [ ] **Muting scripted dialogue does not mute souls (1.1.216)**
+  - Bradley does: mute the scripted Text and Voice masters, then let a scene fire.
+  - Claude watches for: `scene-playback` lines and `vetoed:speech-floor`.
+  - Pass when: scenes play normally. A silent scripted lane must never close the floor — that would be the
+    lane-separation rule broken.
+- [ ] **Mount and animal lines stop repeating (1.1.216)**
+  - Bradley does: stay mounted near the same animals for five minutes.
+  - Claude watches for: repeats of "Nice horse.", "That's a quality animal.", "I respect a well-behaved
+    animal." with their timestamps and speakers.
+  - Pass when: no line repeats inside five minutes, from either bot. The 1.1.215 log repeated at 122s, 123s
+    and 91s.
+- [ ] **A hurt wolf still gets an answer (1.1.216)**
+  - Bradley does: let a wolf take damage near both bots, twice, about fifteen seconds apart.
+  - Claude watches for: the wolf-hurt line and which bot said it.
+  - Pass when: the second event still draws a line — the per-pool dedup must not have inherited the
+    five-minute animal window.
+- [ ] **The woodcut storm is gone (1.1.216)** — the repro Bradley captured
+  - Bradley does: take every axe, plank and stick off Jake, leave him idle near trees for three minutes.
+  - Claude watches for: `Idle hobby 'woodcut' finished for Jake: success=false` and
+    `skipping hobby 'woodcut' backing off: failures=N remaining=…s`.
+  - Pass when: the failure line appears a handful of times at widening intervals, never more than once a
+    minute, and never the 3–19 per second of the 1.1.215 log.
+- [ ] **The backoff ladder widens (1.1.216)**
+  - Bradley does: keep watching the same idle Jake for ten minutes.
+  - Claude watches for: the `remaining=` values across successive skip lines.
+  - Pass when: the gaps widen roughly 60s, 120s, 240s, 480s and then hold at ten minutes.
+- [ ] **An axe in a chest wakes it back up (1.1.216)**
+  - Bradley does: once Jake is deep in a long backoff, put an axe where he can reach it.
+  - Claude watches for: the next `Idle wooden fallback` / woodcut start.
+  - Pass when: he retries within seconds rather than waiting out the remaining backoff.
+- [ ] **Commanded work still starts immediately (1.1.216)**
+  - Bradley does: with Jake in a woodcut backoff, issue `/bot woodcut Jake` directly.
+  - Claude watches for: the skill starting.
+  - Pass when: the command runs at once — the backoff gates the idle fallback only, never a direct order.
 
 ## Phase 7 — Conversation ontology (1.1.196, 1.1.197, 1.1.198)
 
