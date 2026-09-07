@@ -170,6 +170,71 @@ public final class HobbyBackoffPolicy {
         return normalized;
     }
 
+    /**
+     * How often a bot serving out a backoff may re-probe the world for the tool it lacks:
+     * 100 ticks = 5 s at 20 tps.
+     *
+     * <p>The scheduler's flat cooldown early-return runs before anything re-reads the world, so
+     * without a probe a bot four failures deep waits out the full ten minutes even after the
+     * commander drops an axe in the chest beside it. The probe exists so the field check "put an
+     * axe in a chest during a long backoff and the bot retries within seconds" passes.
+     *
+     * <p>It is throttled because the probe is not free: it pulls from every accessible container
+     * around the bot, and running that at tick rate would trade a restart storm for a scan storm.
+     * Five seconds is short enough to read as "immediately" to a player standing there and long
+     * enough that the scan costs one pass per hundred ticks instead of one per tick.
+     */
+    public static final long AVAILABILITY_PROBE_TICKS = 100L;
+
+    /**
+     * Whether a backed-off hobby may re-probe the world for the tool it lacks on this tick.
+     *
+     * <p>Three gates, in order: there must actually be a backoff running (a plain in-flight
+     * cooldown does not justify a container scan), a bot that has never probed always may, and
+     * otherwise at least {@code intervalTicks} must have passed since the last probe. A
+     * {@code nowTick} earlier than the recorded probe means the server tick counter restarted
+     * under us (an integrated-server world reload), which is treated as "probe now" rather than
+     * stranding the bot behind a stale future timestamp.
+     *
+     * @param backoffRunning whether a failure backoff is currently suppressing the hobby
+     * @param lastProbeTick  tick of this bot's previous probe, or {@code null} if it has never probed
+     * @param nowTick        current server tick
+     * @param intervalTicks  minimum ticks between probes (see {@link #AVAILABILITY_PROBE_TICKS})
+     */
+    public static boolean shouldProbeAvailability(boolean backoffRunning,
+                                                  Long lastProbeTick,
+                                                  long nowTick,
+                                                  long intervalTicks) {
+        if (!backoffRunning) {
+            return false;
+        }
+        if (lastProbeTick == null) {
+            return true;
+        }
+        long last = lastProbeTick.longValue();
+        if (nowTick < last) {
+            return true;
+        }
+        return nowTick - last >= Math.max(intervalTicks, 0L);
+    }
+
+    /**
+     * Whether what a probe found justifies dropping the backoff.
+     *
+     * <p>Only a definitive availability flip counts: the tool is now held, or the bot holds the
+     * inputs to make one. Anything weaker — the bot moved, picked something up, a container came
+     * into range — is <em>not</em> a reset trigger. That distinction is the whole point: the
+     * coarse accessible-supply signature the scheduler also tracks is position-dependent, so a
+     * following bot with no axe flips it merely by walking, and resetting on it re-opens the
+     * restart storm this class exists to prevent.
+     *
+     * @param toolHeld  the needed tool is now in the bot's inventory
+     * @param craftable the bot can craft it right now from what it holds
+     */
+    public static boolean probeClearsBackoff(boolean toolHeld, boolean craftable) {
+        return toolHeld || craftable;
+    }
+
     /** Human-readable one-liner for the scheduler's "still backing off" log line. */
     public static String describe(String hobby, int consecutiveFailures, long remainingTicks) {
         return String.format("hobby '%s' backing off: failures=%d remaining=%.0fs",

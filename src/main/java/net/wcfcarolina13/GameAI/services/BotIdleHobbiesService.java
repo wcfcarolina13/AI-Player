@@ -74,8 +74,18 @@ public final class BotIdleHobbiesService {
     private static final long WOODEN_FALLBACK_CRAFT_RETRY_TICKS = 20L * 20L;
     private static final int WOODEN_FALLBACK_STARVING_HUNGER = 10;
     private static final long FOOD_RECHECK_TICKS = 40L;
+    /**
+     * Minimum ticks between two wooden-fallback availability probes for one bot (100 ticks = 5 s).
+     *
+     * <p>See {@link HobbyBackoffPolicy#AVAILABILITY_PROBE_TICKS} for why the probe exists (a long
+     * backoff must still notice an axe appearing in a reachable chest) and why it is throttled
+     * (the probe scans every accessible container, and this method runs every tick).
+     */
+    private static final long WOODEN_FALLBACK_PROBE_TICKS = HobbyBackoffPolicy.AVAILABILITY_PROBE_TICKS;
     private static final Map<UUID, Long> NEXT_WOODEN_FALLBACK_TICK = new ConcurrentHashMap<>();
     private static final Map<UUID, Integer> LAST_WOODEN_FALLBACK_SIGNATURE = new ConcurrentHashMap<>();
+    /** Tick of each bot's last wooden-fallback availability probe; written on the server tick thread. */
+    private static final Map<UUID, Long> LAST_WOODEN_FALLBACK_PROBE_TICK = new ConcurrentHashMap<>();
 
     private static final Map<UUID, Long> NEXT_LEATHER_ARMOR_TICK = new ConcurrentHashMap<>();
     private static final Map<UUID, Long> NEXT_COBBLESTONE_TOOLS_TICK = new ConcurrentHashMap<>();
@@ -117,6 +127,7 @@ public final class BotIdleHobbiesService {
         IDLE_SINCE_TICK.clear();
         NEXT_WOODEN_FALLBACK_TICK.clear();
         LAST_WOODEN_FALLBACK_SIGNATURE.clear();
+        LAST_WOODEN_FALLBACK_PROBE_TICK.clear();
         NEXT_LEATHER_ARMOR_TICK.clear();
         NEXT_COBBLESTONE_TOOLS_TICK.clear();
         HOBBY_NEXT_ALLOWED_TICK.clear();
@@ -1183,6 +1194,12 @@ public final class BotIdleHobbiesService {
         boolean needAxe = !ToolProvisionService.hasUsableAxe(bot);
         if (!needWeapon && !needAxe) {
             clearWoodenFallbackState(botUuid);
+            // The definitive availability flip, and the only safe place to reset the escalation
+            // ladder: reaching this line means the bot actually holds a usable axe AND a
+            // serviceable weapon, so the fallback has nothing left to do. It cannot fire while the
+            // bot is toolless, so it cannot re-open the restart storm.
+            clearWoodenFallbackBackoff(botUuid);
+            LAST_WOODEN_FALLBACK_PROBE_TICK.remove(botUuid);
             return false;
         }
 
@@ -1199,16 +1216,22 @@ public final class BotIdleHobbiesService {
             }
             LAST_WOODEN_FALLBACK_SIGNATURE.put(botUuid, signature);
             NEXT_WOODEN_FALLBACK_TICK.remove(botUuid);
-            // The signature flipping IS the "world changed" signal — an axe appeared in a reachable
-            // chest, a crafting input arrived. Reset the HobbyBackoffPolicy escalation ladder here
-            // (not in clearWoodenFallbackState, which fires on ordinary task-switch churn and must
-            // leave the ladder alone) or the bot keeps serving out a ten-minute wait it no longer
-            // deserves.
-            clearWoodenFallbackBackoff(botUuid);
+            // Deliberately does NOT reset the HobbyBackoffPolicy escalation ladder here. This
+            // coarse signature is not a valid "world changed" trigger: it hashes the containers
+            // scanned at the bot's CURRENT position (ToolProvisionService
+            // .computeAccessibleIdleFallbackSignature), so it flips on movement alone. A following
+            // bot with no axe would wipe its own backoff simply by walking, and the two-tick
+            // restart storm cd4120ca fixed would come straight back. The backoff is reset only on
+            // a real availability flip: the toolless early-out above, or the throttled probe below.
         }
 
         long nextAllowed = NEXT_WOODEN_FALLBACK_TICK.getOrDefault(botUuid, 0L);
         if (nowTick < nextAllowed) {
+            // Nothing below this early return re-reads the world, and a long backoff is mirrored
+            // onto this flat cooldown further down, so without a probe here a bot four failures
+            // deep serves out the full ten minutes no matter what the commander does. Probe
+            // instead — throttled, because the scan is not free at tick rate.
+            probeWoodenFallbackAvailability(bot, world, needWeapon, needAxe, nowTick);
             return true;
         }
 
@@ -1702,15 +1725,16 @@ public final class BotIdleHobbiesService {
      * commander drops an axe in a nearby chest thirty seconds later, the accessible-supply
      * signature flips — and the fallback still stays suppressed for another nine minutes.
      *
-     * <p>Called ONLY from the tool-signature-change branch in
-     * {@link #maybeHandleIdleWoodenFallback}, deliberately — that is the one site that knows the
-     * bot's accessible tool/weapon supply actually changed (an axe appeared in a reachable
-     * chest, a crafting input arrived), as opposed to the bot merely switching tasks. A first
-     * fix-wave version also called this from {@link #clearWoodenFallbackState}, which fires on
-     * every ordinary not-idle/follow/sheltered/active-task tick; that reset the escalation ladder
-     * back to its 60-second first step on unrelated scheduling churn and defeated the doubling
-     * backoff {@code HobbyBackoffPolicy} exists to provide. Keep this call scoped to the real
-     * signal only.
+     * <p>Called from exactly two sites, both of which observe a <em>definitive</em> availability
+     * flip: the {@code !needWeapon && !needAxe} early-out in {@link #maybeHandleIdleWoodenFallback}
+     * (the bot demonstrably holds both tools) and {@link #probeWoodenFallbackAvailability} (an axe
+     * is now held or craftable). Two earlier versions called it from weaker signals and both were
+     * wrong: {@link #clearWoodenFallbackState} fires on every ordinary
+     * not-idle/follow/sheltered/active-task tick, which reset the ladder to its 60-second first
+     * step on unrelated scheduling churn; and the tool-signature-change branch looked like a
+     * "world changed" signal but hashes containers scanned at the bot's current position, so a
+     * toolless bot wiped its own backoff just by walking and the restart storm returned. Keep this
+     * call scoped to real availability only.
      *
      * <p>Scoped to {@link #WOODEN_FALLBACK_HOBBY} deliberately: this is wooden-fallback state, and
      * only the fallback's own start site consults the backoff gate. Clearing every hobby's counter
@@ -1734,6 +1758,64 @@ public final class BotIdleHobbiesService {
         if (logged != null) {
             logged.remove(key);
         }
+    }
+
+    /**
+     * Re-checks, at most once every {@link #WOODEN_FALLBACK_PROBE_TICKS}, whether a bot serving out
+     * a woodcut backoff can now get an axe — and drops the backoff if it can.
+     *
+     * <p><b>Why it exists.</b> The flat-cooldown early return in
+     * {@link #maybeHandleIdleWoodenFallback} fires before any world read, and a running backoff is
+     * mirrored onto that cooldown, so a bot four failures deep would otherwise wait out its full
+     * ten minutes however the world changes around it. The field check this serves is: put an axe
+     * in a chest beside a backed-off bot and it retries within about five seconds.
+     *
+     * <p><b>Why it is throttled.</b> {@code maybeHandleIdleWoodenFallback} runs every server tick
+     * for every idle bot, and the probe pulls from every accessible container around the bot.
+     * Unthrottled that trades a restart storm for a scan storm; once per 100 ticks reads as
+     * immediate to a player and costs one scan per five seconds per toolless idle bot.
+     *
+     * <p><b>Why only these two signals reset.</b> Only an axe now held, or the inputs to craft one
+     * now held, count — the definitive availability flip. Movement, a pickup, or a container coming
+     * into range are not resets: that is exactly what the position-dependent accessible-supply
+     * signature measures, and resetting on it is what re-opens the storm.
+     *
+     * <p>The pull is a world/inventory mutation, so this must stay on the server tick thread; its
+     * only caller already is.
+     *
+     * @return true when the backoff was cleared by this probe
+     */
+    private static boolean probeWoodenFallbackAvailability(ServerPlayerEntity bot,
+                                                           ServerWorld world,
+                                                           boolean needWeapon,
+                                                           boolean needAxe,
+                                                           long nowTick) {
+        if (bot == null || world == null) {
+            return false;
+        }
+        UUID botUuid = bot.getUuid();
+        boolean backoffRunning = hobbyNextAllowedTick(botUuid, WOODEN_FALLBACK_HOBBY) > nowTick;
+        if (!HobbyBackoffPolicy.shouldProbeAvailability(backoffRunning,
+                LAST_WOODEN_FALLBACK_PROBE_TICK.get(botUuid), nowTick, WOODEN_FALLBACK_PROBE_TICKS)) {
+            return false;
+        }
+        LAST_WOODEN_FALLBACK_PROBE_TICK.put(botUuid, nowTick);
+        ToolProvisionService.pullNearbyAccessibleIdleFallbackSupplies(bot, world, needWeapon, needAxe);
+        boolean axeHeld = ToolProvisionService.hasUsableAxe(bot);
+        boolean craftable = ToolProvisionService.canCraftIdleWoodenFallback(bot, needWeapon, needAxe);
+        if (!HobbyBackoffPolicy.probeClearsBackoff(axeHeld, craftable)) {
+            // Found nothing: leave both the backoff and the throttle counter's meaning intact —
+            // the bot keeps waiting exactly as long as it was going to.
+            return false;
+        }
+        clearWoodenFallbackBackoff(botUuid);
+        // Also drop the mirrored flat cooldown, or the bot would keep waiting on the copy of the
+        // backoff we just cleared.
+        NEXT_WOODEN_FALLBACK_TICK.remove(botUuid);
+        LAST_WOODEN_FALLBACK_PROBE_TICK.remove(botUuid);
+        LOGGER.info("Idle wooden fallback: {} availability probe cleared the woodcut backoff (axe={}, craftable={})",
+                bot.getName().getString(), axeHeld, craftable);
+        return true;
     }
 
     /** Hobby the wooden fallback dispatches; the only hobby reachable without going through pickHobby. */

@@ -3,6 +3,7 @@ package net.wcfcarolina13.GameAI.services;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class HobbyBackoffPolicyTest {
@@ -154,6 +155,85 @@ class HobbyBackoffPolicyTest {
         assertEquals("", HobbyBackoffPolicy.normalizeHobbyKey("   "));
         // A bare prefix carries no hobby name and must not be mistaken for one.
         assertEquals("", HobbyBackoffPolicy.normalizeHobbyKey("skill:"));
+    }
+
+    // --- availability probe (1.1.216 regression fix) ---
+    //
+    // The scheduler's flat-cooldown early return happens before anything re-reads the world, so a
+    // bot deep in a backoff needs a throttled probe to notice an axe arriving in a nearby chest.
+    // The reset trigger it replaces — a coarse accessible-supply signature — was position
+    // dependent and flipped on movement alone, which wiped the backoff and re-opened the storm.
+
+    @Test
+    void aProbeThatFindsNothingDoesNotResetTheBackoff() {
+        assertFalse(HobbyBackoffPolicy.probeClearsBackoff(false, false));
+    }
+
+    @Test
+    void anAvailabilityFlipResetsTheBackoff() {
+        // false -> true: the axe is now held, or its inputs are.
+        assertFalse(HobbyBackoffPolicy.probeClearsBackoff(false, false));
+        assertTrue(HobbyBackoffPolicy.probeClearsBackoff(true, false));
+        assertTrue(HobbyBackoffPolicy.probeClearsBackoff(false, true));
+        assertTrue(HobbyBackoffPolicy.probeClearsBackoff(true, true));
+    }
+
+    @Test
+    void theProbeOnlyRunsWhileABackoffIsRunning() {
+        // A plain in-flight cooldown does not justify a container scan.
+        assertFalse(HobbyBackoffPolicy.shouldProbeAvailability(false, null, NOW,
+                HobbyBackoffPolicy.AVAILABILITY_PROBE_TICKS));
+        assertFalse(HobbyBackoffPolicy.shouldProbeAvailability(false, NOW - 10_000L, NOW,
+                HobbyBackoffPolicy.AVAILABILITY_PROBE_TICKS));
+    }
+
+    @Test
+    void aBotThatHasNeverProbedMayProbeImmediately() {
+        assertTrue(HobbyBackoffPolicy.shouldProbeAvailability(true, null, NOW,
+                HobbyBackoffPolicy.AVAILABILITY_PROBE_TICKS));
+    }
+
+    @Test
+    void theThrottleAdmitsAtMostOneProbePerHundredTicks() {
+        assertEquals(100L, HobbyBackoffPolicy.AVAILABILITY_PROBE_TICKS);
+        long interval = HobbyBackoffPolicy.AVAILABILITY_PROBE_TICKS;
+        // Same tick, one tick later, one tick short of the window: all refused.
+        assertFalse(HobbyBackoffPolicy.shouldProbeAvailability(true, NOW, NOW, interval));
+        assertFalse(HobbyBackoffPolicy.shouldProbeAvailability(true, NOW, NOW + 1L, interval));
+        assertFalse(HobbyBackoffPolicy.shouldProbeAvailability(true, NOW, NOW + interval - 1L, interval));
+        // Exactly the window: admitted.
+        assertTrue(HobbyBackoffPolicy.shouldProbeAvailability(true, NOW, NOW + interval, interval));
+        assertTrue(HobbyBackoffPolicy.shouldProbeAvailability(true, NOW, NOW + interval + 1L, interval));
+    }
+
+    @Test
+    void theThrottleAdmitsExactlyOneProbePerWindowOverALongBackoff() {
+        // Walk every tick of a full 10-minute backoff and count the admitted probes: one per 100
+        // ticks, never the per-tick scan storm the throttle exists to prevent.
+        long interval = HobbyBackoffPolicy.AVAILABILITY_PROBE_TICKS;
+        Long last = null;
+        int probes = 0;
+        for (long tick = NOW; tick < NOW + HobbyBackoffPolicy.MAX_BACKOFF_TICKS; tick++) {
+            if (HobbyBackoffPolicy.shouldProbeAvailability(true, last, tick, interval)) {
+                probes++;
+                last = tick;
+            }
+        }
+        assertEquals((int) (HobbyBackoffPolicy.MAX_BACKOFF_TICKS / interval), probes);
+    }
+
+    @Test
+    void aRestartedTickCounterDoesNotStrandTheProbe() {
+        // Integrated-server world reload: server ticks restart, so a recorded probe can sit in the
+        // future. Probe now rather than waiting for the counter to climb back.
+        assertTrue(HobbyBackoffPolicy.shouldProbeAvailability(true, NOW + 5_000L, NOW,
+                HobbyBackoffPolicy.AVAILABILITY_PROBE_TICKS));
+    }
+
+    @Test
+    void aNonPositiveIntervalStillProbesAtMostOncePerTick() {
+        assertTrue(HobbyBackoffPolicy.shouldProbeAvailability(true, NOW - 1L, NOW, 0L));
+        assertTrue(HobbyBackoffPolicy.shouldProbeAvailability(true, NOW, NOW, -5L));
     }
 
     @Test
