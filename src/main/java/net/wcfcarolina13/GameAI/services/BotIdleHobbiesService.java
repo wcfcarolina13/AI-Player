@@ -80,6 +80,20 @@ public final class BotIdleHobbiesService {
     private static final Map<UUID, Long> NEXT_LEATHER_ARMOR_TICK = new ConcurrentHashMap<>();
     private static final Map<UUID, Long> NEXT_COBBLESTONE_TOOLS_TICK = new ConcurrentHashMap<>();
 
+    /**
+     * Per-bot, per-hobby escalating backoff (see {@link HobbyBackoffPolicy}).
+     *
+     * <p>Keyed per hobby rather than globally so a hobby that keeps failing (woodcut with no axe
+     * and no reachable tree) never suppresses one that would succeed. All three maps are written
+     * only from the server tick thread — the picker itself, or the {@code server.execute} block in
+     * {@link #startAmbientSkill}'s completion handler — so the inner maps need no extra locking
+     * beyond being concurrent.
+     */
+    private static final Map<UUID, Map<String, Long>> HOBBY_NEXT_ALLOWED_TICK = new ConcurrentHashMap<>();
+    private static final Map<UUID, Map<String, Integer>> HOBBY_FAILURE_COUNT = new ConcurrentHashMap<>();
+    /** Next-allowed tick most recently logged as "still backing off", so we log once per window. */
+    private static final Map<UUID, Map<String, Long>> HOBBY_BACKOFF_LOGGED_FOR = new ConcurrentHashMap<>();
+
     private static final Map<UUID, String> LAST_HOBBY = new ConcurrentHashMap<>();
     private static final Map<UUID, Long> LAST_HOBBY_END_MS = new ConcurrentHashMap<>();
     private static final Map<UUID, Long> PREFER_COOKING_UNTIL = new ConcurrentHashMap<>();
@@ -105,6 +119,9 @@ public final class BotIdleHobbiesService {
         LAST_WOODEN_FALLBACK_SIGNATURE.clear();
         NEXT_LEATHER_ARMOR_TICK.clear();
         NEXT_COBBLESTONE_TOOLS_TICK.clear();
+        HOBBY_NEXT_ALLOWED_TICK.clear();
+        HOBBY_FAILURE_COUNT.clear();
+        HOBBY_BACKOFF_LOGGED_FOR.clear();
         LAST_BLOCKED_REASON_KEY.clear();
         LAST_BLOCKED_REASON_LOG_TICK.clear();
         PREFER_COOKING_UNTIL.clear();
@@ -287,7 +304,16 @@ public final class BotIdleHobbiesService {
                     continue;
                 }
                 IDLE_SINCE_TICK.remove(botUuid);
-                clearWoodenFallbackState(botUuid);
+                // Do NOT wipe the wooden-fallback cooldown while the fallback's own woodcut run is
+                // the active task. That wipe is what turned a doomed one-tree woodcut into a
+                // two-tick restart storm (2026-09-06 field log): :1195 armed a 12 s cooldown, this
+                // branch removed it on the very next tick, the skill exited inside one tick with
+                // "I have no axe…", and the picker restarted it immediately. Clearing after an
+                // *unrelated* task is still correct — the world may have changed underneath — so
+                // narrow the wipe instead of dropping it.
+                if (!isWoodenFallbackOwnTask(activeTask.get())) {
+                    clearWoodenFallbackState(botUuid);
+                }
                 noteBlocked(bot, nowTick, "active-task");
                 continue;
             }
@@ -1075,6 +1101,10 @@ public final class BotIdleHobbiesService {
                 }
                 SkillContext skillContext = new SkillContext(botSource, SharedStateService.safeSharedState("idle-hobbies"), params, botSource);
                 SkillExecutionResult result = SkillManager.runSkill(skillToRun, skillContext);
+                // Sampled here, on the worker, in the same window SkillManager's own finally block
+                // reads it: TaskService.complete does not clear ABORT_LATCH, but a later tick can.
+                // A cancelled run must not count as a failure against the hobby's backoff.
+                final boolean abortRequested = TaskService.isAbortRequested(botUuid);
                 // We intentionally do not echo result here; many skills already speak during execution.
                 LOGGER.info("Idle hobby '{}' finished for {}: success={} msg='{}'",
                         skillToRun, bot.getName().getString(), result != null && result.success(), result != null ? result.message() : "null");
@@ -1091,14 +1121,18 @@ public final class BotIdleHobbiesService {
                     if (bot.isRemoved() || !bot.isAlive()) {
                         return;
                     }
+                    long now = server.getTicks();
+                    boolean ok = result != null && result.success();
+                    // Arm the per-(bot, hobby) backoff before the remaining guards: if the bot is
+                    // momentarily busy again, the outcome of this run must still be remembered, or
+                    // a deterministic failure would keep restarting behind a 12 s flat cooldown.
+                    recordHobbyAttempt(botUuid, skillToRun, ok, abortRequested, now);
                     if (!BotHomeService.isIdleHobbiesEnabled(bot)) {
                         return;
                     }
                     if (TaskService.hasActiveTask(botUuid)) {
                         return;
                     }
-                    long now = server.getTicks();
-                    boolean ok = result != null && result.success();
                     long delay;
                     if (woodenFallback) {
                         delay = ok ? 20L : WOODEN_FALLBACK_COOLDOWN_TICKS;
@@ -1192,6 +1226,23 @@ public final class BotIdleHobbiesService {
                 return true;
             }
             if (canStartFallbackWoodcut(world, bot)) {
+                // Escalating per-(bot, hobby) backoff, not the flat 12 s cooldown: a woodcut that
+                // exits inside one tick with "I have no axe…" is deterministic, and a flat cooldown
+                // retries it forever at the tick rate. See HobbyBackoffPolicy.
+                if (isHobbyBackedOff(bot, WOODEN_FALLBACK_HOBBY, nowTick)) {
+                    // Mirror the backoff onto the flat cooldown so the pull/craft probe above this
+                    // point isn't re-run every 12 s while the woodcut itself is suppressed. The one
+                    // exception is a pass that actually moved or crafted something: the situation
+                    // genuinely changed, and both of those are self-limiting (the chest empties),
+                    // so the usual short retry still applies.
+                    long backoffNext = hobbyNextAllowedTick(botUuid, WOODEN_FALLBACK_HOBBY);
+                    NEXT_WOODEN_FALLBACK_TICK.put(botUuid,
+                            (moved || crafted) ? Math.min(backoffNext, nowTick + 40L) : backoffNext);
+                    LAST_WOODEN_FALLBACK_SIGNATURE.put(botUuid, ToolProvisionService.computeAccessibleIdleFallbackSignature(bot, world));
+                    return true;
+                }
+                // Short in-flight guard only; the authoritative wait after a failure is armed by
+                // recordHobbyAttempt when the run finishes.
                 NEXT_WOODEN_FALLBACK_TICK.put(botUuid, nowTick + WOODEN_FALLBACK_COOLDOWN_TICKS);
                 LAST_WOODEN_FALLBACK_SIGNATURE.put(botUuid, ToolProvisionService.computeAccessibleIdleFallbackSignature(bot, world));
                 LAST_HOBBY.put(botUuid, "woodcut");
@@ -1626,6 +1677,127 @@ public final class BotIdleHobbiesService {
         }
         NEXT_WOODEN_FALLBACK_TICK.remove(botUuid);
         LAST_WOODEN_FALLBACK_SIGNATURE.remove(botUuid);
+    }
+
+    /** Hobby the wooden fallback dispatches; the only hobby reachable without going through pickHobby. */
+    private static final String WOODEN_FALLBACK_HOBBY = "woodcut";
+
+    /**
+     * True when the currently active task is the run the wooden fallback itself started.
+     *
+     * <p>{@code ActiveTaskInfo.name()} is the ticket name, which {@code TaskService.beginSkill}
+     * builds as {@code "skill:" + skillName} — so the prefix has to come off before comparing.
+     * Ambient hobbies do not carry {@code Origin.AMBIENT} (they go through
+     * {@code SkillManager.runSkill} → {@code beginSkill}, not {@code beginAmbientSkill}), so the
+     * name is the only usable discriminator; a commander-issued {@code /bot woodcut} therefore also
+     * matches, which merely means the fallback waits out its remaining cooldown afterwards.
+     */
+    private static boolean isWoodenFallbackOwnTask(TaskService.ActiveTaskInfo activeTask) {
+        if (activeTask == null || activeTask.name() == null) {
+            return false;
+        }
+        String normalized = activeTask.name().trim().toLowerCase(Locale.ROOT);
+        if (normalized.startsWith("skill:")) {
+            normalized = normalized.substring("skill:".length());
+        }
+        return WOODEN_FALLBACK_HOBBY.equals(normalized);
+    }
+
+    private static String normalizeHobbyKey(String hobby) {
+        return hobby == null ? "" : hobby.trim().toLowerCase(Locale.ROOT);
+    }
+
+    /** Earliest tick this (bot, hobby) pair may start again, per {@link HobbyBackoffPolicy}. */
+    private static long hobbyNextAllowedTick(UUID botUuid, String hobby) {
+        if (botUuid == null) {
+            return 0L;
+        }
+        Map<String, Long> perHobby = HOBBY_NEXT_ALLOWED_TICK.get(botUuid);
+        return perHobby == null ? 0L : perHobby.getOrDefault(normalizeHobbyKey(hobby), 0L);
+    }
+
+    private static int hobbyFailureCount(UUID botUuid, String hobby) {
+        if (botUuid == null) {
+            return 0;
+        }
+        Map<String, Integer> perHobby = HOBBY_FAILURE_COUNT.get(botUuid);
+        return perHobby == null ? 0 : perHobby.getOrDefault(normalizeHobbyKey(hobby), 0);
+    }
+
+    /**
+     * Records a finished hobby attempt into the per-(bot, hobby) backoff.
+     *
+     * <p><b>Server tick thread only.</b> Every other writer of these maps is the picker in
+     * {@link #onServerTick}; keeping this one inside the completion handler's
+     * {@code server.execute} block keeps the counter tick-ordered with the gate that reads it.
+     */
+    private static void recordHobbyAttempt(UUID botUuid, String hobby, boolean success,
+                                           boolean abortRequested, long nowTick) {
+        if (botUuid == null) {
+            return;
+        }
+        String key = normalizeHobbyKey(hobby);
+        if (key.isEmpty()) {
+            return;
+        }
+        int prior = hobbyFailureCount(botUuid, key);
+        int updated = HobbyBackoffPolicy.nextFailureCount(prior, success, abortRequested);
+        long nextAllowed = HobbyBackoffPolicy.nextAllowedTick(
+                new HobbyBackoffPolicy.Attempt(key, success, abortRequested, prior, nowTick));
+
+        if (updated <= 0) {
+            Map<String, Integer> counts = HOBBY_FAILURE_COUNT.get(botUuid);
+            if (counts != null) {
+                counts.remove(key);
+            }
+        } else {
+            HOBBY_FAILURE_COUNT.computeIfAbsent(botUuid, u -> new ConcurrentHashMap<>()).put(key, updated);
+        }
+
+        if (nextAllowed <= nowTick) {
+            Map<String, Long> allowed = HOBBY_NEXT_ALLOWED_TICK.get(botUuid);
+            if (allowed != null) {
+                allowed.remove(key);
+            }
+            Map<String, Long> logged = HOBBY_BACKOFF_LOGGED_FOR.get(botUuid);
+            if (logged != null) {
+                logged.remove(key);
+            }
+            return;
+        }
+
+        HOBBY_NEXT_ALLOWED_TICK.computeIfAbsent(botUuid, u -> new ConcurrentHashMap<>()).put(key, nextAllowed);
+        Map<String, Long> logged = HOBBY_BACKOFF_LOGGED_FOR.get(botUuid);
+        if (logged != null) {
+            logged.remove(key);
+        }
+    }
+
+    /**
+     * True while a (bot, hobby) pair is still inside its failure backoff window.
+     *
+     * <p>Logs the skip at most once per window — the gate is consulted every tick, so a per-tick
+     * log would recreate the very spam the backoff exists to stop.
+     */
+    private static boolean isHobbyBackedOff(ServerPlayerEntity bot, String hobby, long nowTick) {
+        if (bot == null) {
+            return false;
+        }
+        UUID botUuid = bot.getUuid();
+        String key = normalizeHobbyKey(hobby);
+        long nextAllowed = hobbyNextAllowedTick(botUuid, key);
+        if (nextAllowed <= nowTick) {
+            return false;
+        }
+        Map<String, Long> logged = HOBBY_BACKOFF_LOGGED_FOR.computeIfAbsent(botUuid, u -> new ConcurrentHashMap<>());
+        Long alreadyLogged = logged.get(key);
+        if (alreadyLogged == null || alreadyLogged.longValue() != nextAllowed) {
+            logged.put(key, nextAllowed);
+            LOGGER.info("Idle hobbies: {} skipping {}",
+                    bot.getName().getString(),
+                    HobbyBackoffPolicy.describe(key, hobbyFailureCount(botUuid, key), nextAllowed - nowTick));
+        }
+        return true;
     }
 
     private static boolean hasBeenIdleLong(UUID botUuid, long nowTick) {
