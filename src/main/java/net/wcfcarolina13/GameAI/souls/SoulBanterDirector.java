@@ -3,6 +3,7 @@ package net.wcfcarolina13.GameAI.souls;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.wcfcarolina13.GameAI.services.CompanionCommunicationPolicy;
+import net.wcfcarolina13.GameAI.services.dialogue.SpeechFloorPolicy;
 import net.wcfcarolina13.GameAI.services.dialogue.SpeechFloorService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -221,7 +222,11 @@ public final class SoulBanterDirector {
      * either lane's toggle, so neither lane is coupled to the other.
      */
     private boolean speechFloorOpen(UUID playerId) {
-        return SpeechFloorService.isFloorOpen(playerId);
+        // Request as SOUL_SCENE_LINE: a scene preempts a floor armed by scripted ambient flavour.
+        // Without that asymmetry a steady scripted stream (4s per line) could close the floor at
+        // every 5s evaluation instant, and because a floor veto does not consume nextEligibleAtMs
+        // the lane would simply be starved forever. See SpeechFloorPolicy.isOpenFor.
+        return SpeechFloorService.isFloorOpen(playerId, SpeechFloorPolicy.Source.SOUL_SCENE_LINE);
     }
 
     /** Phase A tail shared by both lanes: fetch recent events off-thread, hop back, fire. */

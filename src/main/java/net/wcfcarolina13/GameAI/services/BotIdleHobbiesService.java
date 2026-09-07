@@ -1199,6 +1199,10 @@ public final class BotIdleHobbiesService {
             }
             LAST_WOODEN_FALLBACK_SIGNATURE.put(botUuid, signature);
             NEXT_WOODEN_FALLBACK_TICK.remove(botUuid);
+            // The signature flipping IS the "world changed" signal — an axe appeared in a reachable
+            // chest, a crafting input arrived. Reset the escalating backoff with the flat cooldown
+            // or the bot keeps serving out a ten-minute wait it no longer deserves.
+            clearWoodenFallbackBackoff(botUuid);
         }
 
         long nextAllowed = NEXT_WOODEN_FALLBACK_TICK.getOrDefault(botUuid, 0L);
@@ -1677,6 +1681,43 @@ public final class BotIdleHobbiesService {
         }
         NEXT_WOODEN_FALLBACK_TICK.remove(botUuid);
         LAST_WOODEN_FALLBACK_SIGNATURE.remove(botUuid);
+        clearWoodenFallbackBackoff(botUuid);
+    }
+
+    /**
+     * Drops the woodcut backoff and its failure count for one bot.
+     *
+     * <p>The backoff otherwise cleared only on success or {@code resetSession}, so it had no
+     * "world changed" reset (1.1.216 review finding 7): four failures arm a ten-minute wait, the
+     * commander drops an axe in a nearby chest thirty seconds later, the accessible-supply
+     * signature flips — and the fallback still stays suppressed for another nine minutes. Every
+     * site that decides the fallback's preconditions have genuinely changed calls this, so a real
+     * change buys a real retry. The flat {@code WOODEN_FALLBACK_COOLDOWN_TICKS} in-flight guard
+     * still bounds how fast a re-armed fallback can restart, which is what keeps a flapping
+     * signature from re-opening the restart storm.
+     *
+     * <p>Scoped to {@link #WOODEN_FALLBACK_HOBBY} deliberately: this is wooden-fallback state, and
+     * only the fallback's own start site consults the backoff gate. Clearing every hobby's counter
+     * here would let an unrelated active task wipe backoffs that nothing in this call path knows
+     * anything about.
+     */
+    private static void clearWoodenFallbackBackoff(UUID botUuid) {
+        if (botUuid == null) {
+            return;
+        }
+        String key = normalizeHobbyKey(WOODEN_FALLBACK_HOBBY);
+        Map<String, Long> allowed = HOBBY_NEXT_ALLOWED_TICK.get(botUuid);
+        if (allowed != null) {
+            allowed.remove(key);
+        }
+        Map<String, Integer> counts = HOBBY_FAILURE_COUNT.get(botUuid);
+        if (counts != null) {
+            counts.remove(key);
+        }
+        Map<String, Long> logged = HOBBY_BACKOFF_LOGGED_FOR.get(botUuid);
+        if (logged != null) {
+            logged.remove(key);
+        }
     }
 
     /** Hobby the wooden fallback dispatches; the only hobby reachable without going through pickHobby. */
@@ -1696,15 +1737,20 @@ public final class BotIdleHobbiesService {
         if (activeTask == null || activeTask.name() == null) {
             return false;
         }
-        String normalized = activeTask.name().trim().toLowerCase(Locale.ROOT);
-        if (normalized.startsWith("skill:")) {
-            normalized = normalized.substring("skill:".length());
-        }
-        return WOODEN_FALLBACK_HOBBY.equals(normalized);
+        return WOODEN_FALLBACK_HOBBY.equals(normalizeHobbyKey(activeTask.name()));
     }
 
+    /**
+     * Canonical key for the per-(bot, hobby) backoff maps.
+     *
+     * <p>Delegates to {@link HobbyBackoffPolicy#normalizeHobbyKey} so the write site and the read
+     * site cannot drift: this used to lower-case only while {@code isWoodenFallbackOwnTask}
+     * stripped the {@code "skill:"} ticket prefix, so a caller passing a ticket name would have
+     * stored {@code "skill:woodcut"} against a gate reading {@code "woodcut"} and silently
+     * disabled the backoff (1.1.216 review finding 8).
+     */
     private static String normalizeHobbyKey(String hobby) {
-        return hobby == null ? "" : hobby.trim().toLowerCase(Locale.ROOT);
+        return HobbyBackoffPolicy.normalizeHobbyKey(hobby);
     }
 
     /** Earliest tick this (bot, hobby) pair may start again, per {@link HobbyBackoffPolicy}. */

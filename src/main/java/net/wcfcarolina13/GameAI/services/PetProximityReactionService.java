@@ -19,6 +19,7 @@ import net.wcfcarolina13.ChatUtils.BotDialoguePlayer;
 import net.wcfcarolina13.ChatUtils.VoiceLineCategory;
 import net.wcfcarolina13.ChatUtils.BotDialogueSounds;
 import net.wcfcarolina13.ChatUtils.ChatUtils;
+import net.wcfcarolina13.ChatUtils.TextLineVisibilityService;
 import net.wcfcarolina13.GameAI.BotEventHandler;
 
 import java.util.List;
@@ -441,11 +442,23 @@ public final class PetProximityReactionService {
      *  own per-pool cooldown — 9 of the 11 pools hold exactly one line, so a bot-agnostic
      *  window would have silently stretched every such pool's designed cadence (review #2).
      *
-     *  <p>Raised from 120s to 300s in 1.1.216: at 120s the window expired BEFORE the 5-minute
-     *  mount/animal pool cooldowns it was meant to cover, so "Nice horse." and "That's a quality
-     *  animal." still crossed between bots at 122–123s in the 2026-09-06 field log. The dedup
-     *  window must be no shorter than the longest pool cooldown it guards. */
-    private static final long GLOBAL_LINE_DEDUP_MS = 300_000L;
+     *  <p>The window is derived PER POOL from that pool's own cooldown (1.1.216 review finding 4).
+     *  It started as one flat 120s constant, which expired before the 5-minute mount/animal pool
+     *  cooldowns it was meant to cover — "Nice horse." and "That's a quality animal." still crossed
+     *  between bots at 122–123s in the 2026-09-06 field log. Raising the flat constant to 300s
+     *  fixed those pools and broke {@code WOLF_HURT_LINES}: a single-line pool on an 8s cooldown,
+     *  where a flat five-minute dedup means the second bot cannot answer a hurt wolf for five
+     *  minutes while the first answers every eight seconds. A pool's cooldown already states how
+     *  often that line is meant to be heard, so it is exactly the right cross-bot window too. */
+    private static final long MIN_LINE_DEDUP_MS = 8_000L;
+
+    /** Ceiling on the derived window: no pool suppresses a cross-bot echo for more than 10 minutes. */
+    private static final long MAX_LINE_DEDUP_MS = 10L * 60_000L;
+
+    /** Cross-bot dedup window for a pool whose (pacing-scaled) cooldown is {@code cooldownMs}. */
+    private static long lineDedupWindowMs(long cooldownMs) {
+        return Math.min(MAX_LINE_DEDUP_MS, Math.max(MIN_LINE_DEDUP_MS, cooldownMs));
+    }
 
     private record LineEcho(UUID botId, long atMs) {
     }
@@ -460,11 +473,20 @@ public final class PetProximityReactionService {
         if (bot == null || pool == null || pool.length == 0) {
             return false;
         }
+        if (forcedLineId != null && forcedLineId.isBlank()) {
+            // A blank forced id is no forced id. Normalised FIRST so every gate below — pool
+            // cooldown, speech floor, cross-bot dedup — sees the same value; when this sat below
+            // the floor check, a blank forced id skipped the floor and was then treated as organic
+            // by the dedup (1.1.216 review finding 6).
+            forcedLineId = null;
+        }
         UUID botId = bot.getUuid();
         long now = System.currentTimeMillis();
+        long effectiveCooldownMs = cooldownMs > 0L
+                ? DialoguePacing.scaledCooldown(DialoguePacing.Stream.SCRIPTED, cooldownMs)
+                : 0L;
         long last = cooldownMap.getOrDefault(botId, 0L);
-        if (forcedLineId == null && cooldownMs > 0L
-                && now - last < DialoguePacing.scaledCooldown(DialoguePacing.Stream.SCRIPTED, cooldownMs)) {
+        if (forcedLineId == null && cooldownMs > 0L && now - last < effectiveCooldownMs) {
             return false;
         }
 
@@ -474,25 +496,24 @@ public final class PetProximityReactionService {
         // move the pile-up), and the pool cooldown is deliberately NOT consumed so the same
         // trigger may speak once the floor reopens. Forced/debug fires (cooldownMs == 0) bypass
         // the floor for the same reason they bypass the dedup: /bot dialogue test must always play.
-        UUID audience = CompanionCommunicationPolicy.resolveOwnerUuid(bot);
-        if (forcedLineId == null && cooldownMs > 0L && !SpeechFloorService.isFloorOpen(audience)) {
+        UUID audience = resolveAudience(bot);
+        if (forcedLineId == null && cooldownMs > 0L
+                && !SpeechFloorService.isFloorOpen(audience, SpeechFloorPolicy.Source.SCRIPTED_AMBIENT)) {
             LOGGER.debug("[dialogue] pet-line dropped bot={} floorRemainingMs={}",
                     bot.getName().getString(), SpeechFloorService.remainingMs(audience));
             return false;
         }
 
-        if (forcedLineId != null && forcedLineId.isBlank()) {
-            forcedLineId = null; // a blank forced id is no forced id (review minor)
-        }
         WeightedLine[] eligible = pool;
         // Dedup applies only to organic fires (cooldownMs > 0): the debug command
         // (/bot dialogue test <trigger>) passes cooldownMs == 0 and must always play.
         if (forcedLineId == null && cooldownMs > 0L) {
+            long dedupWindowMs = lineDedupWindowMs(effectiveCooldownMs);
             java.util.List<WeightedLine> fresh = new java.util.ArrayList<>(pool.length);
             for (WeightedLine candidate : pool) {
                 LineEcho echo = GLOBAL_LAST_LINE.get(candidate.id);
                 boolean recentlyByAnotherBot = echo != null && !botId.equals(echo.botId())
-                        && now - echo.atMs() < GLOBAL_LINE_DEDUP_MS;
+                        && now - echo.atMs() < dedupWindowMs;
                 if (!recentlyByAnotherBot) {
                     fresh.add(candidate);
                 }
@@ -510,12 +531,20 @@ public final class PetProximityReactionService {
 
         GLOBAL_LAST_LINE.put(line.id, new LineEcho(botId, now));
         cooldownMap.put(botId, now);
-        // The line is committed from here on (overhead + voice-or-chat): arm the audience's floor
-        // so no other bot and no soul lane speaks over it.
-        SpeechFloorService.noteSpeech(audience, SpeechFloorPolicy.Source.SCRIPTED_AMBIENT);
+
+        // The floor is armed only if a surface actually DELIVERED something (1.1.216 review
+        // finding 2). Every surface below carries its own mask — the overhead hologram consults
+        // TextLineVisibilityService, the voice consults the voice masks — so arming before the
+        // attempt meant a fully muted scripted lane still silenced the soul lane for four seconds
+        // per line. That is a lane gated on another lane's TOGGLE, which the project's dialogue
+        // lane-separation rule forbids: a lane may only be gated on live speaking state.
+        boolean overheadShown = TextLineVisibilityService.isTextAllowed(VoiceLineCategory.fromTag("pet"));
         CompanionOverheadDialogueService.showOverheadLine(bot, line.text, 3_000, 48.0, "pet", line.id);
         BotDialoguePlayer.PlayResult result = BotDialoguePlayer.playSoundForBotDetailed(bot, line.sound, VoiceLineCategory.AMBIENT_CHATTER);
         if (result == BotDialoguePlayer.PlayResult.PLAYED || result == BotDialoguePlayer.PlayResult.THROTTLED) {
+            // THROTTLED is not a delivery: the voice mutex swallowed it and no chat fallback runs.
+            noteSpeechIfDelivered(audience,
+                    overheadShown || result == BotDialoguePlayer.PlayResult.PLAYED);
             return true;
         }
 
@@ -525,7 +554,34 @@ public final class PetProximityReactionService {
                 true,
                 VoiceLineCategory.AMBIENT_CHATTER
         );
+        noteSpeechIfDelivered(audience,
+                overheadShown || TextLineVisibilityService.isTextAllowed(VoiceLineCategory.AMBIENT_CHATTER));
         return true;
+    }
+
+    /**
+     * The player this bot's ambient flavour is aimed at, or {@code null} when there is nobody to
+     * aim it at (unowned bot, owner offline) — in which case the floor is skipped entirely rather
+     * than keyed onto a shared sentinel (1.1.216 review finding 3).
+     *
+     * <p>Uses {@code resolveController}, not {@code resolveOwnerUuid}: the latter reads only the
+     * config {@code botOwnership} map, which is written solely by survival recruitment and
+     * {@code /bot setowner}, so for an ordinary spawned bot it returns null. The controller
+     * resolver carries the survival-recruitment fallback and only returns a player who is online.
+     */
+    private static UUID resolveAudience(ServerPlayerEntity bot) {
+        if (bot == null || !(bot.getEntityWorld() instanceof ServerWorld world)) {
+            return null;
+        }
+        ServerPlayerEntity controller = CompanionCommunicationPolicy.resolveController(world.getServer(), bot);
+        return controller == null ? null : controller.getUuid();
+    }
+
+    /** Arms the audience's floor only when at least one surface actually showed or sent the line. */
+    private static void noteSpeechIfDelivered(UUID audience, boolean delivered) {
+        if (delivered) {
+            SpeechFloorService.noteSpeech(audience, SpeechFloorPolicy.Source.SCRIPTED_AMBIENT);
+        }
     }
 
     private static WeightedLine pickWeightedLine(WeightedLine[] pool, String forcedLineId) {

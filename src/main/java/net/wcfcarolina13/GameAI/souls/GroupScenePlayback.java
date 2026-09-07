@@ -302,7 +302,13 @@ public final class GroupScenePlayback {
         // The single finish site is also the one place the post-scene quiet period is armed:
         // scene occupancy clears here, and without this the audience is immediately fair game for
         // the next scene and for every scripted ambient pool.
-        SpeechFloorService.noteSpeech(state.scene.turn().ownerId(), SpeechFloorPolicy.Source.SOUL_SCENE_END);
+        //
+        // Only when the scene actually said something, though: finish() also runs for aborted and
+        // zero-line scenes (no roster, no audio, a provider miss), and muting the audience for
+        // twenty seconds because a conversation FAILED to happen is silence nobody asked for.
+        if (state.delivered > 0) {
+            SpeechFloorService.noteSpeech(state.scene.turn().ownerId(), SpeechFloorPolicy.Source.SOUL_SCENE_END);
+        }
         LOGGER.info("[souls] scene-playback routingId={} outcome={} delivered={}/{}",
                 state.scene.turn().routingId(), outcome, state.delivered, state.scene.lines().size());
         committer.sceneFinished(state.scene.token(), state.delivered, state.scene.lines().size());

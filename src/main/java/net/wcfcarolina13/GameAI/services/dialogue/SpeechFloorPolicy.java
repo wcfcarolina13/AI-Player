@@ -119,6 +119,36 @@ public final class SpeechFloorPolicy {
         return nowMs >= sanitize(nowMs, busyUntilMs);
     }
 
+    /** True for the lanes that carry a soul scene, which outrank scripted flavour. */
+    public static boolean isSceneSource(Source source) {
+        return source == Source.SOUL_SCENE_LINE || source == Source.SOUL_SCENE_END;
+    }
+
+    /**
+     * Source-aware floor query: may {@code requesting} speak, given a floor armed by
+     * {@code armedBy}?
+     *
+     * <p>Why this exists (1.1.216 review finding 1): {@code SoulBanterDirector} evaluates the
+     * banter lanes once every 100 ticks and a floor veto does not consume its
+     * {@code nextEligibleAtMs}. A scripted ambient line arms a 4s floor, so a steady scripted
+     * stream — two companions taking turns near a pen full of animals — could close the floor at
+     * every single 5s evaluation instant and lock the soul lane out indefinitely, logging nothing
+     * but {@code vetoed:speech-floor}. A symmetric floor starves the lane it was meant to protect.
+     *
+     * <p>The ordering is therefore explicit rather than symmetric: <b>a scene preempts scripted
+     * flavour.</b> A request from {@link Source#SOUL_SCENE_LINE} or {@link Source#SOUL_SCENE_END}
+     * ignores a floor armed by {@link Source#SCRIPTED_AMBIENT}; a request from
+     * {@code SCRIPTED_AMBIENT} respects every armed floor, scene floors included. Note this is
+     * only about who may START speaking — the monotonic {@link #armedUntil} is untouched, so a
+     * scene's floor still cannot be shortened by a later scripted arm.
+     */
+    public static boolean isOpenFor(long nowMs, long busyUntilMs, Source armedBy, Source requesting) {
+        if (isOpen(nowMs, busyUntilMs)) {
+            return true;
+        }
+        return isSceneSource(requesting) && armedBy == Source.SCRIPTED_AMBIENT;
+    }
+
     /**
      * The new busy-until stamp after {@code source} speaks at {@code nowMs}.
      *
@@ -129,6 +159,24 @@ public final class SpeechFloorPolicy {
      */
     public static long armedUntil(long nowMs, long currentBusyUntilMs, Source source) {
         return Math.max(sanitize(nowMs, currentBusyUntilMs), nowMs + floorDurationMs(source));
+    }
+
+    /**
+     * Which source owns the floor after {@code incoming} arms at {@code nowMs}.
+     *
+     * <p>Kept in lockstep with {@link #armedUntil}: whoever set the surviving (later) deadline is
+     * the one recorded, so {@link #isOpenFor} can never be handed a deadline that belongs to one
+     * source and a label that belongs to another. A tie goes to the incoming source — the newer
+     * arm is at least as long, so it fully covers the old one.
+     */
+    public static Source armedBySource(long nowMs, long currentBusyUntilMs, Source currentArmedBy,
+                                       Source incoming) {
+        if (incoming == null) {
+            return currentArmedBy;
+        }
+        long existing = sanitize(nowMs, currentBusyUntilMs);
+        long fresh = nowMs + floorDurationMs(incoming);
+        return fresh >= existing ? incoming : currentArmedBy;
     }
 
     /** Milliseconds until the floor reopens, clamped at 0. For logging only. */

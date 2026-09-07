@@ -126,4 +126,40 @@ class HobbyBackoffPolicyTest {
         assertTrue(text.contains("failures=2"), text);
         assertTrue(text.contains("60s"), text);
     }
+
+    // --- key normalisation (1.1.216 review finding 8) ---
+
+    @Test
+    void theSkillPrefixNormalizesToTheSameKeyAsTheBareName() {
+        // TaskService.beginSkill builds ticket names as "skill:" + skillName. The read site
+        // stripped that prefix while the write site did not, so a caller passing a ticket name
+        // would have stored "skill:woodcut" against a gate reading "woodcut" and silently
+        // disabled the backoff. One normaliser, both sites.
+        assertEquals("woodcut", HobbyBackoffPolicy.normalizeHobbyKey("skill:woodcut"));
+        assertEquals("woodcut", HobbyBackoffPolicy.normalizeHobbyKey("woodcut"));
+        assertEquals(HobbyBackoffPolicy.normalizeHobbyKey("woodcut"),
+                HobbyBackoffPolicy.normalizeHobbyKey("skill:woodcut"));
+    }
+
+    @Test
+    void normalizationTrimsAndLowerCasesAroundThePrefix() {
+        assertEquals("woodcut", HobbyBackoffPolicy.normalizeHobbyKey("  SKILL:Woodcut  "));
+        assertEquals("woodcut", HobbyBackoffPolicy.normalizeHobbyKey("Skill: woodcut"));
+        assertEquals("collect_dirt", HobbyBackoffPolicy.normalizeHobbyKey("skill:collect_dirt"));
+    }
+
+    @Test
+    void normalizationHandlesEmptyAndNullNames() {
+        assertEquals("", HobbyBackoffPolicy.normalizeHobbyKey(null));
+        assertEquals("", HobbyBackoffPolicy.normalizeHobbyKey("   "));
+        // A bare prefix carries no hobby name and must not be mistaken for one.
+        assertEquals("", HobbyBackoffPolicy.normalizeHobbyKey("skill:"));
+    }
+
+    @Test
+    void onlyALeadingPrefixIsStripped() {
+        // "skill" is not a prefix, and an embedded one is part of the name.
+        assertEquals("skillet", HobbyBackoffPolicy.normalizeHobbyKey("skillet"));
+        assertEquals("woodcut:skill:x", HobbyBackoffPolicy.normalizeHobbyKey("woodcut:skill:x"));
+    }
 }

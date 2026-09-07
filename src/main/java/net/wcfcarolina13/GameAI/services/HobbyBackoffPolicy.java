@@ -144,6 +144,32 @@ public final class HobbyBackoffPolicy {
         return nextFailureCount(prior, success);
     }
 
+    /**
+     * Ticket-name prefix {@code TaskService.beginSkill} puts in front of every skill name.
+     */
+    private static final String SKILL_TICKET_PREFIX = "skill:";
+
+    /**
+     * Canonical map key for a hobby name.
+     *
+     * <p>Trims, lower-cases, and — the point of this being shared (1.1.216 review finding 8) —
+     * strips the {@code "skill:"} ticket prefix that {@code TaskService.beginSkill} builds into
+     * {@code ActiveTaskInfo.name()}. The scheduler's read site already stripped it while the write
+     * site did not; that only worked because every caller happened to pass a bare name, and the
+     * first caller to pass a ticket name would have written {@code "skill:woodcut"}, never matched
+     * the read site, and silently disabled the gate. One normaliser, used by both.
+     */
+    public static String normalizeHobbyKey(String hobby) {
+        if (hobby == null) {
+            return "";
+        }
+        String normalized = hobby.trim().toLowerCase(java.util.Locale.ROOT);
+        if (normalized.startsWith(SKILL_TICKET_PREFIX)) {
+            normalized = normalized.substring(SKILL_TICKET_PREFIX.length()).trim();
+        }
+        return normalized;
+    }
+
     /** Human-readable one-liner for the scheduler's "still backing off" log line. */
     public static String describe(String hobby, int consecutiveFailures, long remainingTicks) {
         return String.format("hobby '%s' backing off: failures=%d remaining=%.0fs",

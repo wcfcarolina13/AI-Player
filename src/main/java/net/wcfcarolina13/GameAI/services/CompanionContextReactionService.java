@@ -55,6 +55,7 @@ import net.wcfcarolina13.ChatUtils.VoiceLineCategory;
 import net.wcfcarolina13.ChatUtils.BotDialogueSounds;
 import net.wcfcarolina13.ChatUtils.ChatUtils;
 import net.wcfcarolina13.GameAI.BotEventHandler;
+import net.wcfcarolina13.ChatUtils.TextLineVisibilityService;
 import net.wcfcarolina13.GameAI.services.dialogue.SpeechFloorPolicy;
 import net.wcfcarolina13.GameAI.services.dialogue.SpeechFloorService;
 
@@ -1173,8 +1174,9 @@ public final class CompanionContextReactionService {
         // player. An organic line arriving while the floor is closed is DROPPED, not deferred,
         // and the trigger cooldown is deliberately NOT consumed so it may speak once the floor
         // reopens. Forced/debug fires bypass the floor so /bot dialogue test always plays.
-        UUID audience = CompanionCommunicationPolicy.resolveOwnerUuid(bot);
-        if (forcedLineId == null && !SpeechFloorService.isFloorOpen(audience)) {
+        UUID audience = resolveAudience(bot);
+        if (forcedLineId == null
+                && !SpeechFloorService.isFloorOpen(audience, SpeechFloorPolicy.Source.SCRIPTED_AMBIENT)) {
             LOGGER.debug("[dialogue] context-line dropped bot={} trigger={} floorRemainingMs={}",
                     bot.getName().getString(), triggerKey, SpeechFloorService.remainingMs(audience));
             return false;
@@ -1188,12 +1190,19 @@ public final class CompanionContextReactionService {
 
         state.lastTriggerMs.put(triggerKey, now);
         state.lastLineByTrigger.put(triggerKey, line.id);
-        // Committed from here on (overhead + voice-or-chat): arm the audience's floor.
-        SpeechFloorService.noteSpeech(audience, SpeechFloorPolicy.Source.SCRIPTED_AMBIENT);
+
+        // The floor is armed only if a surface actually DELIVERED something (1.1.216 review
+        // finding 2). Each surface carries its own mask, so arming before the attempt let a fully
+        // muted scripted lane silence the soul lane — a lane gated on another lane's TOGGLE, which
+        // the project's dialogue lane-separation rule forbids.
+        boolean overheadShown = TextLineVisibilityService.isTextAllowed(VoiceLineCategory.fromTag("context"));
         CompanionOverheadDialogueService.showOverheadLine(bot, line.text, 3_000, 48.0, "context", triggerKey);
 
         BotDialoguePlayer.PlayResult result = BotDialoguePlayer.playSoundForBotDetailed(bot, line.sound, VoiceLineCategory.REACTIONS);
         if (result == BotDialoguePlayer.PlayResult.PLAYED || result == BotDialoguePlayer.PlayResult.THROTTLED) {
+            // THROTTLED is not a delivery: the voice mutex swallowed it and no chat fallback runs.
+            noteSpeechIfDelivered(audience,
+                    overheadShown || result == BotDialoguePlayer.PlayResult.PLAYED);
             return true;
         }
 
@@ -1203,7 +1212,35 @@ public final class CompanionContextReactionService {
                 true,
                 VoiceLineCategory.REACTIONS
         );
+        noteSpeechIfDelivered(audience,
+                overheadShown || TextLineVisibilityService.isTextAllowed(VoiceLineCategory.REACTIONS));
         return true;
+    }
+
+    /**
+     * The player this bot's reaction lines are aimed at, or {@code null} when there is nobody to
+     * aim them at — in which case the floor is skipped entirely rather than keyed onto a shared
+     * sentinel (1.1.216 review finding 3).
+     *
+     * <p>Uses {@code resolveController}, not {@code resolveOwnerUuid}: the latter reads only the
+     * config {@code botOwnership} map (written by survival recruitment and {@code /bot setowner}
+     * alone), so for an ordinary spawned bot it returns null and the floor never met the soul
+     * lanes, which key the real player id. The controller resolver carries the recruitment
+     * fallback and only returns a player who is online.
+     */
+    private static UUID resolveAudience(ServerPlayerEntity bot) {
+        if (bot == null || !(bot.getEntityWorld() instanceof ServerWorld world)) {
+            return null;
+        }
+        ServerPlayerEntity controller = CompanionCommunicationPolicy.resolveController(world.getServer(), bot);
+        return controller == null ? null : controller.getUuid();
+    }
+
+    /** Arms the audience's floor only when at least one surface actually showed or sent the line. */
+    private static void noteSpeechIfDelivered(UUID audience, boolean delivered) {
+        if (delivered) {
+            SpeechFloorService.noteSpeech(audience, SpeechFloorPolicy.Source.SCRIPTED_AMBIENT);
+        }
     }
 
     private static WeightedLine pickWeightedLine(WeightedLine[] pool, String forcedLineId, String lastLineId) {
